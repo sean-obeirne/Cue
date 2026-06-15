@@ -21,8 +21,8 @@
 #define PIN_STATUS_RGB     GPIO_NUM_48
 
 /* ---- I2C0 (SSD1309 OLED, future sensors) ---- */
-#define PIN_I2C_SDA        GPIO_NUM_8
-#define PIN_I2C_SCL        GPIO_NUM_9
+#define PIN_I2C_SDA        GPIO_NUM_7
+#define PIN_I2C_SCL        GPIO_NUM_14
 #define I2C_HZ             400000
 
 /* SSD1309 / SSD1306-compatible 2.42" 128×64 panel */

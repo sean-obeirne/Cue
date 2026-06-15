@@ -12,4 +12,5 @@ idf_component_register(
         ui
         freertos
         log
+        esp_driver_i2c
 )
