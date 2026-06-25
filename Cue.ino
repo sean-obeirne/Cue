@@ -41,9 +41,9 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 
-// ---- Pins (match Cue/repos/Cue/components/board/include/board.h) ------------
-#define OLED_SDA 7     // PIN_I2C_SDA
-#define OLED_SCL 14    // PIN_I2C_SCL
+// ---- Pins (temporary test pair: untried pads) --------------------------------
+#define OLED_SDA 15
+#define OLED_SCL 16
 #define OLED_ADDR 0x3C // DISPLAY_I2C_ADDR
 // 100kHz standard-mode while bringing the bus up. REQUIRES external pull-ups
 // (SDA->3V3, SCL->3V3); with none, only the ESP32 internal ~45k holds the lines
@@ -83,7 +83,7 @@ static bool i2cProbe(uint8_t addr)
 // mis-set address still shows up instead of just "not found".
 static void i2cScan(void)
 {
-    Serial.println(F("[oled] I2C scan on SDA=7 SCL=14:"));
+    Serial.printf("[oled] I2C scan on SDA=%d SCL=%d:\n", OLED_SDA, OLED_SCL);
     int found = 0;
     for (uint8_t a = 0x03; a <= 0x77; a++)
     {
@@ -113,8 +113,10 @@ static void drawTestScreen(uint32_t tick)
 
         u8g2.setFont(u8g2_font_5x7_tr); // tiny details
         u8g2.drawStr(6, 30, "SSD1309 128x64 @0x3C");
-        u8g2.drawStr(6, 40, "SDA=GPIO7  SCL=GPIO14");
-        u8g2.drawStr(6, 50, "I2C 400kHz  spike test");
+        char pins[32];
+        snprintf(pins, sizeof(pins), "SDA=GPIO%d  SCL=GPIO%d", OLED_SDA, OLED_SCL);
+        u8g2.drawStr(6, 40, pins);
+        u8g2.drawStr(6, 50, "I2C 100kHz  spike test");
 
         // moving marker: a filled box that steps across the bottom each refresh.
         int16_t x = 6 + (int16_t)(tick % 110);

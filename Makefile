@@ -73,7 +73,7 @@ upload: build port-check
 .PHONY: monitor
 monitor: port-check
 	@echo ">> Monitor on $(PORT) @ $(BAUD)  (Ctrl-C to exit)"
-	$(CLI) monitor -p "$(PORT)" -c baudrate=$(BAUD)
+	$(CLI) monitor -p "$(PORT)" -c baudrate=$(BAUD),dtr=off,rts=off
 
 .PHONY: flash
 flash: upload monitor
