@@ -1,6 +1,6 @@
 # ============================================================================
 #  Makefile — build / upload / monitor for the cue-new OLED bring-up spike
-#  Target board: ESP32-S3 N16R8 (16MB flash / 8MB OPI PSRAM)
+#  Target board: ESP32 DevKitV1 (ESP32-WROOM-32, 4MB flash, no PSRAM)
 #  Mirrors ../not-cue/Makefile so the workflow is identical.
 # ============================================================================
 #  Common usage:
@@ -26,18 +26,20 @@
 
 SKETCH_DIR := $(CURDIR)
 BUILD_DIR  := $(SKETCH_DIR)/build
-# CDCOnBoot=default routes Serial to UART0 (the CH343 COM port = ttyACM0) so the
-# [oled] I2C scan prints on the same port `make monitor` watches. Use =cdc to
-# send Serial to the native-USB port instead.
-FQBN       := esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,CDCOnBoot=default
-PORT       ?= /dev/ttyACM0
+# Classic ESP32 DevKitV1 (ESP32-WROOM-32). Serial goes to UART0 via the on-board
+# CP2102/CH340 = the USB COM port `make monitor` watches; no CDCOnBoot on classic.
+FQBN       := esp32:esp32:esp32doit-devkit-v1
+PORT       ?= /dev/ttyUSB0
 BAUD       ?= 115200
 CLI        := arduino-cli
 
 # --- Direct-flash settings (esptool v4) -------------------------------------
 ESPTOOL          ?= esptool
-CHIP             := esp32s3
-FLASH_BAUD       ?= 460800
+CHIP             := esp32
+# 115200: this board's USB-serial adapter fails at 460800 ("No serial data
+# received" right after the baud switch, + garbled crystal-freq detection).
+# 115200 flashes reliably (~34s for 4MB). Bump only if you swap to a better cable.
+FLASH_BAUD       ?= 115200
 BEFORE           ?= default_reset
 AFTER            ?= hard_reset
 CONNECT_ATTEMPTS ?= 0
@@ -86,7 +88,8 @@ ports:
 port-check:
 	@if [ ! -e "$(PORT)" ]; then \
 		echo "!! Port $(PORT) not found."; \
-		echo "   Plug the board's NATIVE USB port, or: make upload PORT=/dev/ttyACMx"; \
+		echo "   Classic ESP32 DevKitV1 enumerates as /dev/ttyUSB0 (CP2102/CH340)."; \
+		echo "   List ports: make ports  (or: make upload PORT=/dev/ttyUSBx)"; \
 		echo "   Connect retries forever: just HOLD BOOT until 'Writing at...'."; \
 		echo "   Or enter download mode by hand: make upload BEFORE=no_reset"; \
 		exit 1; \
