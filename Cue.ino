@@ -29,8 +29,10 @@
  *   - Every second we run an I2C scan and print what ACKs. This is the real
  *     signal: it tells us if the panel is electrically present BEFORE we worry
  *     about pixels.
- *   - Only after 0x3C ACKs do we init U8g2 and draw. If it never ACKs, the
- *     serial log tells us whether to add RES-high or pull-ups next.
+ *   - FLICKER-FREE ANIMATION: full-buffer redraws every frame made the panel
+ *     shimmer (proven by a draw-once test). So we push the whole screen ONCE,
+ *     then animate the moving marker with updateDisplayArea() on just the
+ *     bottom 8px tile strip — the text rows are never retransmitted.
  *
  *  WHAT YOU SHOULD SEE
  *  -------------------
@@ -52,11 +54,12 @@
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_ADDR 0x3C
-// 100 kHz standard-mode for bring-up. With NO external pull-ups the bus is held
-// up only by the ESP32's internal ~45k, so rise time is slow -> keep it slow.
-// If the panel ACKs but the image is a garbled "barcode", THAT is the cue that
-// real pull-ups (SDA->3V3, SCL->3V3) are finally needed; raise to 400000 then.
-#define OLED_HZ 100000
+// 400 kHz fast-mode. At 100 kHz the full-frame transfer took ~90ms and the
+// repaint was visible as flicker; 400 kHz cuts that ~4x so the redraw is too
+// quick to see. NO external pull-ups yet, so the faster edges rely on the
+// ESP32 internal ~45k. If this shows a garbled "barcode", THAT is the proof
+// pull-ups (SDA->3V3, SCL->3V3) are finally needed -> then drop back if so.
+#define OLED_HZ 400000
 
 // SSD1309, full-buffer ("_F_"), hardware I2C. reset=NONE because RES is not
 // wired yet; U8g2 won't toggle a reset line it doesn't have.
@@ -95,28 +98,59 @@ static bool i2cScan(void)
     return oled;
 }
 
-// Build one full frame. `tick` drives a moving marker so a live panel is
-// obviously live and not a frozen splash.
-static void drawTestScreen(uint32_t tick)
+// Marker geometry. The moving box lives entirely within the bottom 8-pixel
+// tile row (y 56..63), which is what lets us update JUST that strip.
+#define MARKER_Y 56
+#define MARKER_W 6
+#define MARKER_H 6
+#define MARKER_X_MIN 6
+#define MARKER_X_SPAN 110 // marker sweeps MARKER_X_MIN .. MARKER_X_MIN+SPAN-1
+
+// Draw the FULL static screen (frame + text + marker) into the buffer and push
+// it ONCE. After this we never send the whole buffer again — only the marker
+// strip changes (see updateMarker), which is what keeps it flicker-free.
+static void drawStaticScreen(int16_t markerX)
 {
-    u8g2.firstPage();
-    do
-    {
-        u8g2.drawFrame(0, 0, 128, 64);
+    u8g2.clearBuffer();
 
-        u8g2.setFont(u8g2_font_ncenB10_tr);
-        u8g2.drawStr(8, 16, "WOO!!");
+    u8g2.drawFrame(0, 0, 128, 64);
 
-        u8g2.setFont(u8g2_font_5x7_tr);
-        u8g2.drawStr(6, 30, "SSD1309 128x64 @0x3C");
-        char pins[32];
-        snprintf(pins, sizeof(pins), "SDA=GPIO%d  SCL=GPIO%d", OLED_SDA, OLED_SCL);
-        u8g2.drawStr(6, 40, pins);
-        u8g2.drawStr(6, 50, "bare bring-up  100kHz");
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(8, 16, "WOO!!");
 
-        int16_t x = 6 + (int16_t)(tick % 110);
-        u8g2.drawBox(x, 56, 6, 6);
-    } while (u8g2.nextPage());
+    u8g2.setFont(u8g2_font_5x7_tr);
+    u8g2.drawStr(6, 30, "SSD1309 128x64 @0x3C");
+    char pins[32];
+    snprintf(pins, sizeof(pins), "SDA=GPIO%d  SCL=GPIO%d", OLED_SDA, OLED_SCL);
+    u8g2.drawStr(6, 40, pins);
+    u8g2.drawStr(6, 50, "bare bring-up  400kHz");
+
+    u8g2.drawBox(markerX, MARKER_Y, MARKER_W, MARKER_H);
+
+    u8g2.sendBuffer(); // single full-buffer push
+}
+
+// Move the marker WITHOUT re-sending the whole frame. We only rewrite the
+// bottom tile row (y 56..63) in the buffer and transmit just those 16x1 tiles
+// via updateDisplayArea() — ~128 bytes instead of the full 1KB. The text rows
+// above are never touched, so there is nothing to flicker.
+static void updateMarker(int16_t markerX)
+{
+    // Erase the whole bottom tile strip in the buffer...
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(0, MARKER_Y, 128, 8);
+    u8g2.setDrawColor(1);
+
+    // ...restore the frame border segments that live in this strip...
+    u8g2.drawVLine(0, MARKER_Y, 8);   // left edge
+    u8g2.drawVLine(127, MARKER_Y, 8); // right edge
+    u8g2.drawHLine(0, 63, 128);       // bottom edge
+
+    // ...draw the marker at its new position...
+    u8g2.drawBox(markerX, MARKER_Y, MARKER_W, MARKER_H);
+
+    // ...and send ONLY tile row 7 (x tiles 0..15 = full width, y tile 7 = y56..63).
+    u8g2.updateDisplayArea(0, 7, 16, 1);
 }
 
 void setup()
@@ -161,17 +195,45 @@ void loop()
 {
     static uint32_t tick = 0;
 
-    // Heartbeat: LED + serial, so proof-of-life survives even with a dark panel.
-    digitalWrite(LED_PIN, HIGH);
-    delay(250);
-    digitalWrite(LED_PIN, LOW);
-    delay(250);
+    // Non-blocking heartbeat: toggle the LED on a ~1Hz schedule using millis()
+    // instead of delay(), so nothing stalls the display refresh (the old
+    // delay()s between blinks were part of the visible flicker).
+    static uint32_t lastBlink = 0;
+    static bool led = false;
+    uint32_t now = millis();
+    if (now - lastBlink >= 500)
+    {
+        lastBlink = now;
+        led = !led;
+        digitalWrite(LED_PIN, led);
+    }
 
     if (g_oledPresent)
     {
-        drawTestScreen(tick);
-        Serial.printf("[oled] frame %lu drawn   heap=%d\n",
-                      (unsigned long)tick, ESP.getFreeHeap());
+        // Draw the full static screen exactly once...
+        static bool drawnOnce = false;
+        if (!drawnOnce)
+        {
+            drawnOnce = true;
+            drawStaticScreen(MARKER_X_MIN);
+            Serial.println(F("[oled] static frame pushed once; "
+                             "marker now animates via partial updates."));
+        }
+
+        // ...then animate the marker with partial (bottom-strip-only) updates.
+        // Only send when it steps to a new column, so the bus stays quiet
+        // between moves and the text above is never retransmitted (no flicker).
+        int16_t markerX = MARKER_X_MIN + (int16_t)((millis() / 40) % MARKER_X_SPAN);
+        static int16_t lastMarkerX = -1;
+        if (markerX != lastMarkerX)
+        {
+            lastMarkerX = markerX;
+            updateMarker(markerX);
+            if ((tick % 60) == 0) // occasional heap log, not per-frame spam
+                Serial.printf("[oled] marker step %lu   heap=%d\n",
+                              (unsigned long)tick, ESP.getFreeHeap());
+            tick++;
+        }
     }
     else
     {
@@ -188,8 +250,7 @@ void loop()
             u8g2.setContrast(255);
             Serial.println(F("[oled] 0x3C just appeared -> initialized, drawing."));
         }
+        tick++;
+        delay(500); // only throttle the scan path, not the drawing path
     }
-
-    tick++;
-    delay(500);
 }
