@@ -107,8 +107,8 @@ static const int8_t QUAD_LUT[16] = {
 struct Encoder
 {
     uint8_t pinA, pinB;
-    uint8_t prev;  // last (A<<1)|B reading
-    int8_t accum;  // accumulated quarter-steps; one detent = 4
+    uint8_t prev; // last (A<<1)|B reading
+    int8_t accum; // accumulated quarter-steps; one detent = 4
 };
 
 struct Button
@@ -148,8 +148,16 @@ static int8_t encoderPoll(Encoder &e)
     if (d == 0)
         return 0;
     e.accum += d;
-    if (e.accum >= 4)  { e.accum = 0; return +1; }
-    if (e.accum <= -4) { e.accum = 0; return -1; }
+    if (e.accum >= 4)
+    {
+        e.accum = 0;
+        return +1;
+    }
+    if (e.accum <= -4)
+    {
+        e.accum = 0;
+        return -1;
+    }
     return 0;
 }
 
