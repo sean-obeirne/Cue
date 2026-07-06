@@ -28,7 +28,11 @@ SKETCH_DIR := $(CURDIR)
 BUILD_DIR  := $(SKETCH_DIR)/build
 # Classic ESP32 DevKitV1 (ESP32-WROOM-32). Serial goes to UART0 via the on-board
 # CP2102/CH340 = the USB COM port `make monitor` watches; no CDCOnBoot on classic.
-FQBN       := esp32:esp32:esp32doit-devkit-v1
+# Use the generic "ESP32 Dev Module" (esp32:esp32:esp32) rather than
+# esp32doit-devkit-v1: the doit board has a FIXED partition table and rejects
+# PartitionScheme, but we need huge_app (3MB app) for the Bluetooth A2DP stack.
+# Same WROOM-32 chip; only the exposed build menus differ.
+FQBN       := esp32:esp32:esp32:PartitionScheme=huge_app
 PORT       ?= /dev/ttyUSB0
 BAUD       ?= 115200
 CLI        := arduino-cli
@@ -55,6 +59,10 @@ all: flash
 deps:
 	@echo ">> Installing U8g2 library"
 	$(CLI) lib install "U8g2"
+	@echo ">> Installing ESP32-A2DP (git — not in the Library Manager)"
+	@test -d "$(HOME)/Arduino/libraries/ESP32-A2DP" \
+		|| git clone --depth 1 https://github.com/pschatzmann/ESP32-A2DP.git \
+			"$(HOME)/Arduino/libraries/ESP32-A2DP"
 
 .PHONY: build
 build:

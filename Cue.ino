@@ -40,6 +40,8 @@
 #include <SPI.h>
 #include "FS.h"
 #include "SD.h"
+#include "BluetoothA2DPSource.h"
+#include <esp_log.h>
 
 // On-board LED on most ESP32 DevKitV1 boards is wired to GPIO2.
 #define LED_PIN 2
@@ -72,6 +74,14 @@ static float g_sdSizeMB = 0;
 static int g_mp3Count = 0;   // total .mp3 files found
 static String g_mp3Names[5]; // first few names, for the OLED/serial
 static int g_mp3Shown = 0;   // how many of g_mp3Names are filled
+
+// ---- Bluetooth A2DP source (streams audio OUT to a BT speaker/headphone) -----
+// Cue is the SOURCE: it connects TO this sink by its advertised name (exact,
+// case-sensitive). Sub-step 1 streams a sine tone to prove the radio path;
+// sub-step 2 will replace the tone with decoded MP3 from the SD card.
+#define BT_SINK_NAME "Moondrop Space Travel"
+static BluetoothA2DPSource a2dp_source;
+static volatile bool g_btConnected = false;
 
 // ---- Input: 2 rotary encoders (A/B/SW) + 4 keyboard switches ----------------
 // All active-low with internal pull-ups (INPUT_PULLUP): idle HIGH, pressed LOW.
@@ -315,40 +325,60 @@ static void sdScan(void)
 
 // Draw the SD scan result ONCE (static screen; the bus then goes idle). Uses
 // the same full-buffer-once approach proven flicker-free in Step 2.
-static void drawSdScreen(void)
+// A2DP data callback (runs on the BT task): fill `frames` with a stereo 440 Hz
+// sine tone at 44.1 kHz. This is the sub-step-1 test signal proving the radio
+// path; sub-step 2 will replace it with decoded MP3 PCM from the SD card.
+static int32_t a2dpSineCallback(Frame *frames, int32_t frameCount)
+{
+    static double phase = 0.0;
+    const double twoPi = 6.283185307179586;
+    const double step = twoPi * 440.0 / 44100.0; // 440 Hz at 44.1 kHz
+    const double amp = 6000.0;                   // well under int16 max (32767)
+    for (int32_t i = 0; i < frameCount; i++)
+    {
+        int16_t s = (int16_t)(amp * sin(phase));
+        frames[i].channel1 = s; // left
+        frames[i].channel2 = s; // right
+        phase += step;
+        if (phase >= twoPi)
+            phase -= twoPi;
+    }
+    return frameCount;
+}
+
+// Combined SD + Bluetooth status screen. Redrawn only on BT state change.
+static void drawStatusScreen(void)
 {
     u8g2.clearBuffer();
     u8g2.drawFrame(0, 0, 128, 64);
 
     u8g2.setFont(u8g2_font_6x12_tr);
-    u8g2.drawStr(5, 12, "CUE  SD SCAN");
+    u8g2.drawStr(5, 12, "CUE  STATUS");
     u8g2.drawHLine(2, 15, 124);
 
     u8g2.setFont(u8g2_font_5x7_tr);
-    char line[32];
+    char line[40];
+
+    // --- SD line ---
     if (!g_sdMounted)
-    {
-        u8g2.drawStr(6, 28, "MOUNT FAILED");
-        u8g2.drawStr(6, 40, "CLK18 MOSI23 MISO19");
-        u8g2.drawStr(6, 50, "CS4  3V3 GND  FAT32?");
-    }
+        u8g2.drawStr(6, 27, "SD: MOUNT FAILED");
     else
     {
-        snprintf(line, sizeof(line), "%s   %.0f MB", g_sdType, g_sdSizeMB);
-        u8g2.drawStr(6, 26, line);
-        snprintf(line, sizeof(line), "MP3 files: %d", g_mp3Count);
-        u8g2.drawStr(6, 36, line);
-
-        int16_t y = 47;
-        for (int i = 0; i < g_mp3Shown && i < 2; i++) // 2 names fit cleanly
-        {
-            String n = g_mp3Names[i];
-            if (n.length() > 20)
-                n = n.substring(0, 20);
-            u8g2.drawStr(6, y, n.c_str());
-            y += 9;
-        }
+        snprintf(line, sizeof(line), "SD:%s %.0fG %dmp3",
+                 g_sdType, g_sdSizeMB / 1024.0, g_mp3Count);
+        u8g2.drawStr(6, 27, line);
     }
+
+    // --- Bluetooth target + state ---
+    snprintf(line, sizeof(line), "BT: %s", BT_SINK_NAME);
+    u8g2.drawStr(6, 40, line);
+    u8g2.drawHLine(2, 45, 124);
+
+    u8g2.setFont(u8g2_font_6x12_tr);
+    if (g_btConnected)
+        u8g2.drawStr(6, 60, ">> STREAMING TONE");
+    else
+        u8g2.drawStr(6, 60, "pairing...");
 
     u8g2.sendBuffer(); // single full-buffer push
 }
@@ -393,6 +423,28 @@ void setup()
     // Configure the rotary encoders + keyboard switches.
     inputInit();
 
+    // Start the Bluetooth A2DP source and begin connecting to the target sink.
+    // Streaming runs on a BT task via a2dpSineCallback; our loop keeps running.
+    // Start the Bluetooth A2DP source and begin connecting to the target sink.
+    // Streaming runs on a BT task via a2dpSineCallback; our loop keeps running.
+    //
+    // Quiet the ESP-IDF Bluetooth stack logs. Each reconnect attempt otherwise
+    // floods the console with BT_AV/BT_API/RCCT log lines. Our own [bt]/[input]
+    // prints go through Serial and are unaffected. General level -> WARN, and
+    // the BT tags fully silenced (they emit errors on every failed reconnect).
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set("BT_AV", ESP_LOG_NONE);
+    esp_log_level_set("BT_API", ESP_LOG_NONE);
+    esp_log_level_set("RCCT", ESP_LOG_NONE);
+
+    // Reconnect FAST after the speaker is turned off/on: auto-reconnect uses the
+    // last device's ADDRESS (cached in NVS, survives reboots) instead of a slow
+    // name-inquiry scan. Must be set BEFORE start().
+    a2dp_source.set_auto_reconnect(true, 1000);
+    Serial.printf("[bt] A2DP source start -> connecting to \"%s\"...\n",
+                  BT_SINK_NAME);
+    a2dp_source.start(BT_SINK_NAME, a2dpSineCallback);
+
     Serial.println(F("[boot] setup done"));
     Serial.println(F("========================================"));
 }
@@ -418,16 +470,39 @@ void loop()
     // steps); activity is printed on serial.
     inputPoll();
 
+    // Fast Bluetooth reconnect: the A2DP library only retries on its internal
+    // ~10s heartbeat timer, so after the speaker is turned off/on you'd wait up
+    // to 10s. We nudge it ourselves every 500ms using the cached address
+    // (reconnect() = a DIRECT connect to the saved address, NOT a scan), so Cue
+    // grabs the speaker the instant it becomes reachable. Extra calls while a
+    // connect is already in flight are harmless no-ops. Gated to fire ONLY after
+    // a genuine drop (we were connected before) so it never disturbs the initial
+    // connect or an active stream.
+    {
+        static uint32_t lastReconnectTry = 0;
+        static bool everConnected = false;
+        if (a2dp_source.is_connected())
+            everConnected = true;
+        else if (everConnected && (now - lastReconnectTry >= 500))
+        {
+            lastReconnectTry = now;
+            a2dp_source.reconnect(); // immediate address-based attempt (no scan)
+        }
+    }
+
     if (g_oledPresent)
     {
-        // Draw the SD scan result screen exactly once; it's static, so the bus
-        // then goes idle (the LED heartbeat still shows the board is alive).
-        static bool drawnOnce = false;
-        if (!drawnOnce)
+        // Draw the status screen at boot, then redraw only when the Bluetooth
+        // connection state changes (rare -> no flicker). Shows SD + BT status.
+        bool conn = a2dp_source.is_connected();
+        static int lastConn = -1;
+        if ((int)conn != lastConn)
         {
-            drawnOnce = true;
-            drawSdScreen();
-            Serial.println(F("[oled] SD scan screen drawn."));
+            lastConn = conn;
+            g_btConnected = conn;
+            drawStatusScreen();
+            Serial.printf("[bt] %s\n", conn ? "CONNECTED -> streaming tone"
+                                            : "not connected (scanning/pairing)");
         }
     }
     else
