@@ -1,71 +1,77 @@
 /*
  * ============================================================================
- *  cue-new  —  STEP 2: bare OLED bring-up for Cue (Arduino + U8g2)
+ *  cue-new  —  STEP 3: microSD bring-up (music library) for Cue
  * ============================================================================
- *  Board : ESP32 DevKitV1 (ESP32-WROOM-32, classic dual-core, 4MB flash)
- *  Panel : 2.42" SSD1309 128x64, I2C, address 0x3C
- *  Lib   : U8g2 by olikraus  (make deps  ->  arduino-cli lib install "U8g2")
+ *  Board : ESP32 DevKitV1 / ELEGOO ESP32 (ESP32-WROOM-32, classic, 4MB flash)
+ *  Panel : 2.42" SSD1309 128x64 OLED, I2C 0x3C  (proven in Step 2)
+ *  Card  : generic 6-pin SPI microSD breakout, card formatted FAT32
+ *  Libs  : U8g2 (display) + SD/SPI/FS (bundled with the ESP32 Arduino core)
  *
  *  PURPOSE
  *  -------
- *  Step 1 proved the bare board boots (LED blink + serial heartbeat). This is
- *  Step 2: add the OLED with the MINIMUM 4 wires and see how far it gets with
- *  NO pull-up resistors and NO RES jumper yet — exactly as much hardware as
- *  has been deemed necessary so far, nothing more.
+ *  Steps 1-2 proved the board + OLED. Step 3 adds the microSD card that will
+ *  hold Cue's music library. This spike mounts the card and lists the .mp3
+ *  files (ignoring any non-mp3 files) on BOTH serial and the OLED — proving the
+ *  storage path before we add MP3 decode + Bluetooth A2DP streaming.
  *
- *  WIRING (OLED -> ESP32 DevKitV1) — bare, 4 wires only:
- *      VCC -> 3V3
- *      GND -> GND
- *      SDA -> GPIO21
- *      SCL -> GPIO22
- *  NOT connected yet (add ONLY if the steps below say we need them):
- *      RES -> (floating for now; our notes warn this can blank the panel)
- *      pull-up resistors on SDA/SCL -> none
+ *  Recipe reused from the PocketPage project (stock Arduino SD.h) but on a
+ *  DEDICATED SPI bus: PocketPage shared its bus with an e-paper panel; Cue's
+ *  display is I2C, so the SD card owns the SPI bus here (simpler + faster).
  *
- *  STRATEGY (keep proof-of-life alive the whole time)
- *  --------------------------------------------------
- *   - The onboard LED keeps blinking and serial keeps a heartbeat, so even if
- *     the panel is dark we still know the board runs and can read the scan.
- *   - Every second we run an I2C scan and print what ACKs. This is the real
- *     signal: it tells us if the panel is electrically present BEFORE we worry
- *     about pixels.
- *   - FLICKER-FREE ANIMATION: full-buffer redraws every frame made the panel
- *     shimmer (proven by a draw-once test). So we push the whole screen ONCE,
- *     then animate the moving marker with updateDisplayArea() on just the
- *     bottom 8px tile strip — the text rows are never retransmitted.
+ *  WIRING — OLED (I2C, unchanged from Step 2):
+ *      VCC->3V3  GND->GND  SDA->GPIO21  SCL->GPIO22
+ *  WIRING — microSD (dedicated SPI):
+ *      3V3->3V3  GND->GND  CLK->GPIO18  MOSI->GPIO23  MISO->GPIO19  CS->GPIO4
+ *      CS=GPIO4 dodges the OLED pins (21/22) and the strapping pins
+ *      (0,2,5,12,15). Add a 10uF cap at the SD 3V3 pad (PocketPage lesson).
  *
  *  WHAT YOU SHOULD SEE
  *  -------------------
- *   A) Best case: "[oled] ACK @ 0x3C  <- OLED", then a framed "WOO!!" test
- *      screen with a moving box, plus the LED blinking.
- *   B) Board fine but panel absent on the bus: heartbeat + "no devices
- *      responded" each scan -> next step is RES->3V3, then pull-ups.
+ *   - Serial: "[sd] OK: SDHC/XC, 31000 MB, N mp3 file(s)" then the names.
+ *   - OLED: an "SD SCAN" screen with card type/size, mp3 count, first names.
+ *   - Onboard LED keeps blinking (proof-of-life) regardless of SD result.
+ *   - Mount fail? Serial + OLED say so and list the wiring to check.
  * ============================================================================
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <SPI.h>
+#include "FS.h"
+#include "SD.h"
 
 // On-board LED on most ESP32 DevKitV1 boards is wired to GPIO2.
 #define LED_PIN 2
 
-// ---- I2C pins (classic ESP32 hardware-I2C default pair, non-strapping) -------
+// ---- I2C pins (OLED — proven in Step 2) -------------------------------------
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_ADDR 0x3C
-// 400 kHz fast-mode. At 100 kHz the full-frame transfer took ~90ms and the
-// repaint was visible as flicker; 400 kHz cuts that ~4x so the redraw is too
-// quick to see. NO external pull-ups yet, so the faster edges rely on the
-// ESP32 internal ~45k. If this shows a garbled "barcode", THAT is the proof
-// pull-ups (SDA->3V3, SCL->3V3) are finally needed -> then drop back if so.
-#define OLED_HZ 400000
+#define OLED_HZ 400000 // 400kHz fast-mode; proven flicker-free in Step 2
 
-// SSD1309, full-buffer ("_F_"), hardware I2C. reset=NONE because RES is not
-// wired yet; U8g2 won't toggle a reset line it doesn't have.
+// ---- SPI pins (microSD — dedicated bus, no sharing) -------------------------
+#define SD_SCK 18
+#define SD_MISO 19
+#define SD_MOSI 23
+#define SD_CS 4
+// Start conservative. PocketPage used 1 MHz over long SHARED soldered leads;
+// Cue's SD owns a short DEDICATED bus, so 4 MHz is a safe start and can be
+// raised later once the path is proven.
+#define SD_HZ 4000000
+
+// SSD1309, full-buffer ("_F_"), hardware I2C. reset=NONE (RES not wired).
 U8G2_SSD1309_128X64_NONAME0_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE);
 
 static bool g_oledPresent = false; // set true once 0x3C ACKs; gates drawing.
+
+// ---- microSD scan results (gathered once at boot) ---------------------------
+static bool g_sdMounted = false;
+static const char *g_sdType = "?";
+static float g_sdSizeMB = 0;
+static int g_mp3Count = 0;   // total .mp3 files found
+static String g_mp3Names[5]; // first few names, for the OLED/serial
+static int g_mp3Shown = 0;   // how many of g_mp3Names are filled
 
 // Raw I2C probe (ACK/NACK) independent of the graphics lib.
 static bool i2cProbe(uint8_t addr)
@@ -98,59 +104,109 @@ static bool i2cScan(void)
     return oled;
 }
 
-// Marker geometry. The moving box lives entirely within the bottom 8-pixel
-// tile row (y 56..63), which is what lets us update JUST that strip.
-#define MARKER_Y 56
-#define MARKER_W 6
-#define MARKER_H 6
-#define MARKER_X_MIN 6
-#define MARKER_X_SPAN 110 // marker sweeps MARKER_X_MIN .. MARKER_X_MIN+SPAN-1
-
-// Draw the FULL static screen (frame + text + marker) into the buffer and push
-// it ONCE. After this we never send the whole buffer again — only the marker
-// strip changes (see updateMarker), which is what keeps it flicker-free.
-static void drawStaticScreen(int16_t markerX)
+// Mount the microSD card on the dedicated SPI bus and collect a summary plus
+// the first few .mp3 filenames. Modeled on PocketPage's scanCard(), filtered
+// for .mp3 and ignoring everything else on the card.
+static void sdScan(void)
 {
-    u8g2.clearBuffer();
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
 
-    u8g2.drawFrame(0, 0, 128, 64);
+    if (!SD.begin(SD_CS, SPI, SD_HZ))
+    {
+        g_sdMounted = false;
+        Serial.println(F("[sd] mount FAILED -> check CLK18 MOSI23 MISO19 CS4, "
+                         "3V3, GND; is the card FAT32?"));
+        return;
+    }
 
-    u8g2.setFont(u8g2_font_ncenB10_tr);
-    u8g2.drawStr(8, 16, "WOO!!");
+    uint8_t t = SD.cardType();
+    if (t == CARD_NONE)
+    {
+        g_sdMounted = false;
+        SD.end();
+        Serial.println(F("[sd] no card detected"));
+        return;
+    }
 
-    u8g2.setFont(u8g2_font_5x7_tr);
-    u8g2.drawStr(6, 30, "SSD1309 128x64 @0x3C");
-    char pins[32];
-    snprintf(pins, sizeof(pins), "SDA=GPIO%d  SCL=GPIO%d", OLED_SDA, OLED_SCL);
-    u8g2.drawStr(6, 40, pins);
-    u8g2.drawStr(6, 50, "bare bring-up  400kHz");
+    g_sdMounted = true;
+    g_sdType = (t == CARD_MMC) ? "MMC" : (t == CARD_SD) ? "SDSC"
+                                     : (t == CARD_SDHC) ? "SDHC/XC"
+                                                        : "?";
+    g_sdSizeMB = SD.cardSize() / (1024.0 * 1024.0);
 
-    u8g2.drawBox(markerX, MARKER_Y, MARKER_W, MARKER_H);
+    File root = SD.open("/");
+    if (root)
+    {
+        for (File e = root.openNextFile(); e; e = root.openNextFile())
+        {
+            if (!e.isDirectory())
+            {
+                String n = e.name();
+                String lower = n;
+                lower.toLowerCase();
+                if (lower.endsWith(".mp3")) // ignore the non-mp3 files
+                {
+                    if (g_mp3Shown < 5)
+                    {
+                        String disp = n;
+                        if (disp.startsWith("/"))
+                            disp = disp.substring(1);
+                        g_mp3Names[g_mp3Shown++] = disp;
+                    }
+                    g_mp3Count++;
+                }
+            }
+            e.close();
+        }
+        root.close();
+    }
 
-    u8g2.sendBuffer(); // single full-buffer push
+    Serial.printf("[sd] OK: %s, %.0f MB, %d mp3 file(s)\n",
+                  g_sdType, g_sdSizeMB, g_mp3Count);
+    for (int i = 0; i < g_mp3Shown; i++)
+        Serial.printf("[sd]   - %s\n", g_mp3Names[i].c_str());
 }
 
-// Move the marker WITHOUT re-sending the whole frame. We only rewrite the
-// bottom tile row (y 56..63) in the buffer and transmit just those 16x1 tiles
-// via updateDisplayArea() — ~128 bytes instead of the full 1KB. The text rows
-// above are never touched, so there is nothing to flicker.
-static void updateMarker(int16_t markerX)
+// Draw the SD scan result ONCE (static screen; the bus then goes idle). Uses
+// the same full-buffer-once approach proven flicker-free in Step 2.
+static void drawSdScreen(void)
 {
-    // Erase the whole bottom tile strip in the buffer...
-    u8g2.setDrawColor(0);
-    u8g2.drawBox(0, MARKER_Y, 128, 8);
-    u8g2.setDrawColor(1);
+    u8g2.clearBuffer();
+    u8g2.drawFrame(0, 0, 128, 64);
 
-    // ...restore the frame border segments that live in this strip...
-    u8g2.drawVLine(0, MARKER_Y, 8);   // left edge
-    u8g2.drawVLine(127, MARKER_Y, 8); // right edge
-    u8g2.drawHLine(0, 63, 128);       // bottom edge
+    u8g2.setFont(u8g2_font_6x12_tr);
+    u8g2.drawStr(5, 12, "CUE  SD SCAN");
+    u8g2.drawHLine(2, 15, 124);
 
-    // ...draw the marker at its new position...
-    u8g2.drawBox(markerX, MARKER_Y, MARKER_W, MARKER_H);
+    u8g2.setFont(u8g2_font_5x7_tr);
+    char line[32];
+    if (!g_sdMounted)
+    {
+        u8g2.drawStr(6, 28, "MOUNT FAILED");
+        u8g2.drawStr(6, 40, "CLK18 MOSI23 MISO19");
+        u8g2.drawStr(6, 50, "CS4  3V3 GND  FAT32?");
+    }
+    else
+    {
+        snprintf(line, sizeof(line), "%s   %.0f MB", g_sdType, g_sdSizeMB);
+        u8g2.drawStr(6, 26, line);
+        snprintf(line, sizeof(line), "MP3 files: %d", g_mp3Count);
+        u8g2.drawStr(6, 36, line);
 
-    // ...and send ONLY tile row 7 (x tiles 0..15 = full width, y tile 7 = y56..63).
-    u8g2.updateDisplayArea(0, 7, 16, 1);
+        int16_t y = 47;
+        for (int i = 0; i < g_mp3Shown && i < 2; i++) // 2 names fit cleanly
+        {
+            String n = g_mp3Names[i];
+            if (n.length() > 20)
+                n = n.substring(0, 20);
+            u8g2.drawStr(6, y, n.c_str());
+            y += 9;
+        }
+    }
+
+    u8g2.sendBuffer(); // single full-buffer push
 }
 
 void setup()
@@ -161,7 +217,7 @@ void setup()
     delay(300);
     Serial.println();
     Serial.println(F("========================================"));
-    Serial.println(F("[boot] Cue STEP 2 — bare OLED bring-up"));
+    Serial.println(F("[boot] Cue STEP 3 — microSD bring-up (music library)"));
     Serial.printf("[boot] chip: %s rev %d, %d core(s)\n",
                   ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores());
     Serial.printf("[boot] free heap: %d bytes\n", ESP.getFreeHeap());
@@ -187,6 +243,9 @@ void setup()
                          "re-scanning each second (check wiring / RES / pull-ups)."));
     }
 
+    // Mount the microSD card (dedicated SPI bus) and scan for .mp3 files.
+    sdScan();
+
     Serial.println(F("[boot] setup done"));
     Serial.println(F("========================================"));
 }
@@ -210,29 +269,14 @@ void loop()
 
     if (g_oledPresent)
     {
-        // Draw the full static screen exactly once...
+        // Draw the SD scan result screen exactly once; it's static, so the bus
+        // then goes idle (the LED heartbeat still shows the board is alive).
         static bool drawnOnce = false;
         if (!drawnOnce)
         {
             drawnOnce = true;
-            drawStaticScreen(MARKER_X_MIN);
-            Serial.println(F("[oled] static frame pushed once; "
-                             "marker now animates via partial updates."));
-        }
-
-        // ...then animate the marker with partial (bottom-strip-only) updates.
-        // Only send when it steps to a new column, so the bus stays quiet
-        // between moves and the text above is never retransmitted (no flicker).
-        int16_t markerX = MARKER_X_MIN + (int16_t)((millis() / 40) % MARKER_X_SPAN);
-        static int16_t lastMarkerX = -1;
-        if (markerX != lastMarkerX)
-        {
-            lastMarkerX = markerX;
-            updateMarker(markerX);
-            if ((tick % 60) == 0) // occasional heap log, not per-frame spam
-                Serial.printf("[oled] marker step %lu   heap=%d\n",
-                              (unsigned long)tick, ESP.getFreeHeap());
-            tick++;
+            drawSdScreen();
+            Serial.println(F("[oled] SD scan screen drawn."));
         }
     }
     else
