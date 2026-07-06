@@ -63,6 +63,10 @@ deps:
 	@test -d "$(HOME)/Arduino/libraries/ESP32-A2DP" \
 		|| git clone --depth 1 https://github.com/pschatzmann/ESP32-A2DP.git \
 			"$(HOME)/Arduino/libraries/ESP32-A2DP"
+	@echo ">> Installing arduino-libhelix MP3 decoder (git)"
+	@test -d "$(HOME)/Arduino/libraries/arduino-libhelix" \
+		|| git clone --depth 1 https://github.com/pschatzmann/arduino-libhelix.git \
+			"$(HOME)/Arduino/libraries/arduino-libhelix"
 
 .PHONY: build
 build:

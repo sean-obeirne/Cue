@@ -42,6 +42,9 @@
 #include "SD.h"
 #include "BluetoothA2DPSource.h"
 #include <esp_log.h>
+#include "MP3DecoderHelix.h"
+#include "freertos/stream_buffer.h"
+using namespace libhelix;
 
 // On-board LED on most ESP32 DevKitV1 boards is wired to GPIO2.
 #define LED_PIN 2
@@ -79,9 +82,24 @@ static int g_mp3Shown = 0;   // how many of g_mp3Names are filled
 // Cue is the SOURCE: it connects TO this sink by its advertised name (exact,
 // case-sensitive). Sub-step 1 streams a sine tone to prove the radio path;
 // sub-step 2 will replace the tone with decoded MP3 from the SD card.
-#define BT_SINK_NAME "Moondrop Space Travel"
+#define BT_SINK_NAME "SoundCore 2"
 static BluetoothA2DPSource a2dp_source;
 static volatile bool g_btConnected = false;
+
+// ---- MP3 -> PCM pipeline (SD file decoded by Helix, buffered for A2DP) --------
+// A decode task reads the first .mp3 off the SD card, Helix decodes it to PCM,
+// and the PCM is pushed into a FreeRTOS stream buffer. The A2DP data callback
+// (BT task) pulls PCM from that buffer on demand. The buffer decouples the two
+// and lets the decoder self-pace (it blocks when the buffer is full).
+#define PCM_BUF_BYTES (16 * 1024) // ~0.09s of 44.1kHz stereo PCM; kept small to
+                                  // leave heap for the BT stack + MP3 decoder
+static StreamBufferHandle_t g_pcmBuf = nullptr;
+static String g_firstMp3Path;             // full path "/name.mp3" of first track
+static volatile bool g_mp3FormatLogged = false;
+// The decoder is allocated ONCE and begun EARLY (in setup, before Bluetooth),
+// while heap is plentiful. Allocating it after A2DP is streaming fails (~8.7KB
+// alloc) and crashes the whole system, so we reserve it up front.
+static MP3DecoderHelix g_mp3;
 
 // ---- Input: 2 rotary encoders (A/B/SW) + 4 keyboard switches ----------------
 // All active-low with internal pull-ups (INPUT_PULLUP): idle HIGH, pressed LOW.
@@ -302,6 +320,11 @@ static void sdScan(void)
                 lower.toLowerCase();
                 if (lower.endsWith(".mp3")) // ignore the non-mp3 files
                 {
+                    if (g_mp3Count == 0)
+                    {
+                        // Remember the first track's full path for playback.
+                        g_firstMp3Path = n.startsWith("/") ? n : ("/" + n);
+                    }
                     if (g_mp3Shown < 5)
                     {
                         String disp = n;
@@ -323,27 +346,66 @@ static void sdScan(void)
         Serial.printf("[sd]   - %s\n", g_mp3Names[i].c_str());
 }
 
-// Draw the SD scan result ONCE (static screen; the bus then goes idle). Uses
-// the same full-buffer-once approach proven flicker-free in Step 2.
-// A2DP data callback (runs on the BT task): fill `frames` with a stereo 440 Hz
-// sine tone at 44.1 kHz. This is the sub-step-1 test signal proving the radio
-// path; sub-step 2 will replace it with decoded MP3 PCM from the SD card.
-static int32_t a2dpSineCallback(Frame *frames, int32_t frameCount)
+// PCM callback from the Helix MP3 decoder (runs on the decode task): push the
+// decoded interleaved stereo samples into the ring buffer. Blocks when the
+// buffer is full, which self-paces the decoder to the A2DP consumption rate.
+static void mp3PcmCallback(MP3FrameInfo &info, short *pcm, size_t len, void *ref)
 {
-    static double phase = 0.0;
-    const double twoPi = 6.283185307179586;
-    const double step = twoPi * 440.0 / 44100.0; // 440 Hz at 44.1 kHz
-    const double amp = 6000.0;                   // well under int16 max (32767)
-    for (int32_t i = 0; i < frameCount; i++)
+    if (!g_mp3FormatLogged)
     {
-        int16_t s = (int16_t)(amp * sin(phase));
-        frames[i].channel1 = s; // left
-        frames[i].channel2 = s; // right
-        phase += step;
-        if (phase >= twoPi)
-            phase -= twoPi;
+        g_mp3FormatLogged = true;
+        Serial.printf("[mp3] format: %d Hz, %d ch, %d-bit\n",
+                      info.samprate, info.nChans, info.bitsPerSample);
+        if (info.samprate != 44100 || info.nChans != 2)
+            Serial.println(F("[mp3] WARNING: expected 44.1kHz stereo; audio may "
+                             "play at the wrong pitch/speed."));
     }
+    if (g_pcmBuf)
+        xStreamBufferSend(g_pcmBuf, pcm, len * sizeof(short), portMAX_DELAY);
+}
+
+// A2DP data callback (runs on the BT task): pull decoded PCM from the ring
+// buffer into the frame buffer. On underrun (buffer empty) output silence so
+// the stream never stalls.
+static int32_t a2dpPcmCallback(Frame *frames, int32_t frameCount)
+{
+    size_t wanted = (size_t)frameCount * sizeof(Frame); // Frame = L+R int16 = 4B
+    size_t got = 0;
+    if (g_pcmBuf)
+        got = xStreamBufferReceive(g_pcmBuf, frames, wanted, 0); // non-blocking
+    if (got < wanted)
+        memset((uint8_t *)frames + got, 0, wanted - got); // silence on underrun
     return frameCount;
+}
+
+// Decode task: read the first .mp3 off the SD card in chunks, feed Helix, and
+// loop the track forever. Helix invokes mp3PcmCallback with the decoded PCM.
+// Uses the global g_mp3, which was already begun in setup().
+static void mp3DecodeTask(void *param)
+{
+    const size_t CHUNK = 1024;
+    uint8_t inbuf[CHUNK];
+
+    for (;;)
+    {
+        File f = SD.open(g_firstMp3Path.c_str(), FILE_READ);
+        if (!f)
+        {
+            Serial.printf("[mp3] cannot open %s\n", g_firstMp3Path.c_str());
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        Serial.printf("[mp3] playing %s (%u bytes)\n",
+                      g_firstMp3Path.c_str(), (unsigned)f.size());
+        while (f.available())
+        {
+            int n = f.read(inbuf, CHUNK);
+            if (n > 0)
+                g_mp3.write(inbuf, n); // -> mp3PcmCallback -> ring buffer
+        }
+        f.close();
+        Serial.println(F("[mp3] end of track -> looping"));
+    }
 }
 
 // Combined SD + Bluetooth status screen. Redrawn only on BT state change.
@@ -376,7 +438,7 @@ static void drawStatusScreen(void)
 
     u8g2.setFont(u8g2_font_6x12_tr);
     if (g_btConnected)
-        u8g2.drawStr(6, 60, ">> STREAMING TONE");
+        u8g2.drawStr(6, 60, ">> PLAYING MP3");
     else
         u8g2.drawStr(6, 60, "pairing...");
 
@@ -423,27 +485,37 @@ void setup()
     // Configure the rotary encoders + keyboard switches.
     inputInit();
 
-    // Start the Bluetooth A2DP source and begin connecting to the target sink.
-    // Streaming runs on a BT task via a2dpSineCallback; our loop keeps running.
-    // Start the Bluetooth A2DP source and begin connecting to the target sink.
-    // Streaming runs on a BT task via a2dpSineCallback; our loop keeps running.
-    //
-    // Quiet the ESP-IDF Bluetooth stack logs. Each reconnect attempt otherwise
-    // floods the console with BT_AV/BT_API/RCCT log lines. Our own [bt]/[input]
-    // prints go through Serial and are unaffected. General level -> WARN, and
-    // the BT tags fully silenced (they emit errors on every failed reconnect).
+    // Build the MP3 -> PCM pipeline ring buffer, and allocate the Helix decoder
+    // NOW while heap is plentiful (before Bluetooth). If we allocate it later
+    // (after A2DP is streaming) the ~8.7KB alloc fails and crashes the system.
+    g_pcmBuf = xStreamBufferCreate(PCM_BUF_BYTES, 1);
+    if (g_sdMounted && g_mp3Count > 0)
+    {
+        g_mp3.setDataCallback(mp3PcmCallback);
+        if (g_mp3.begin())
+            Serial.printf("[mp3] decoder ready, free heap now %d\n",
+                          ESP.getFreeHeap());
+        else
+            Serial.println(F("[mp3] decoder begin FAILED (out of memory)"));
+    }
+    else
+        Serial.println(F("[mp3] no track to play (card/mp3 missing) -> silence"));
+
+    // Quiet the ESP-IDF Bluetooth stack logs (each reconnect attempt otherwise
+    // floods the console). Our own [bt]/[input] prints go through Serial and are
+    // unaffected. General level -> WARN, BT tags fully silenced.
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set("BT_AV", ESP_LOG_NONE);
     esp_log_level_set("BT_API", ESP_LOG_NONE);
     esp_log_level_set("RCCT", ESP_LOG_NONE);
 
-    // Reconnect FAST after the speaker is turned off/on: auto-reconnect uses the
-    // last device's ADDRESS (cached in NVS, survives reboots) instead of a slow
-    // name-inquiry scan. Must be set BEFORE start().
+    // Start the Bluetooth A2DP source: connect to the sink and stream the
+    // decoded MP3 PCM (a2dpPcmCallback pulls from the ring buffer). Reconnect
+    // FAST after off/on via the cached address (set BEFORE start()).
     a2dp_source.set_auto_reconnect(true, 1000);
     Serial.printf("[bt] A2DP source start -> connecting to \"%s\"...\n",
                   BT_SINK_NAME);
-    a2dp_source.start(BT_SINK_NAME, a2dpSineCallback);
+    a2dp_source.start(BT_SINK_NAME, a2dpPcmCallback);
 
     Serial.println(F("[boot] setup done"));
     Serial.println(F("========================================"));
@@ -490,6 +562,22 @@ void loop()
         }
     }
 
+    // Launch the MP3 decode task on the FIRST successful BT connection. Decoding
+    // before a consumer exists is pointless, and it keeps heavy decode load away
+    // from the power-sensitive BT connect phase (where the reset loop appeared).
+    {
+        static bool decodeStarted = false;
+        if (!decodeStarted && a2dp_source.is_connected() &&
+            g_pcmBuf && g_sdMounted && g_mp3Count > 0)
+        {
+            decodeStarted = true;
+            Serial.printf("[mp3] BT connected -> starting decode task for %s\n",
+                          g_firstMp3Path.c_str());
+            xTaskCreatePinnedToCore(mp3DecodeTask, "mp3dec", 8192, nullptr, 5,
+                                    nullptr, 1);
+        }
+    }
+
     if (g_oledPresent)
     {
         // Draw the status screen at boot, then redraw only when the Bluetooth
@@ -501,7 +589,7 @@ void loop()
             lastConn = conn;
             g_btConnected = conn;
             drawStatusScreen();
-            Serial.printf("[bt] %s\n", conn ? "CONNECTED -> streaming tone"
+            Serial.printf("[bt] %s\n", conn ? "CONNECTED -> streaming mp3"
                                             : "not connected (scanning/pairing)");
         }
     }
