@@ -73,6 +73,142 @@ static int g_mp3Count = 0;   // total .mp3 files found
 static String g_mp3Names[5]; // first few names, for the OLED/serial
 static int g_mp3Shown = 0;   // how many of g_mp3Names are filled
 
+// ---- Input: 2 rotary encoders (A/B/SW) + 4 keyboard switches ----------------
+// All active-low with internal pull-ups (INPUT_PULLUP): idle HIGH, pressed LOW.
+// Encoder commons -> GND; each switch's other leg -> GND. No external resistors.
+#define ENC1_A 32
+#define ENC1_B 33
+#define ENC1_SW 25
+#define ENC2_A 26
+#define ENC2_B 27
+#define ENC2_SW 14
+#define SW1_PIN 13
+#define SW2_PIN 16
+#define SW3_PIN 17
+// GPIO15 is a STRAPPING pin. INPUT_PULLUP idles it HIGH (its required boot
+// level), so it's safe here; holding SW4 during power-on only mutes the
+// boot-ROM debug log, which is harmless.
+#define SW4_PIN 15
+
+#define DEBOUNCE_MS 25
+
+// TEMP: set to 1 to print every raw A/B transition on the encoders (diagnoses
+// wiring vs decode). Set back to 0 once the encoders are confirmed working.
+#define ENC_DEBUG 0
+
+// Quadrature transition table. Index = (prev<<2)|curr, each 2 bits = (A<<1)|B.
+// Value = direction of that Gray-code transition (-1/0/+1 quarter-step).
+static const int8_t QUAD_LUT[16] = {
+    0, -1, 1, 0,
+    1, 0, 0, -1,
+    -1, 0, 0, 1,
+    0, 1, -1, 0};
+
+struct Encoder
+{
+    uint8_t pinA, pinB;
+    uint8_t prev;  // last (A<<1)|B reading
+    int8_t accum;  // accumulated quarter-steps; one detent = 4
+};
+
+struct Button
+{
+    uint8_t pin;
+    const char *name;
+    bool stable;       // debounced level (HIGH = released)
+    bool lastRead;     // last raw read
+    uint32_t lastEdge; // millis() of last raw change
+};
+
+static Encoder g_enc1 = {ENC1_A, ENC1_B, 0, 0};
+static Encoder g_enc2 = {ENC2_A, ENC2_B, 0, 0};
+static int32_t g_enc1Pos = 0, g_enc2Pos = 0;
+
+static Button g_buttons[] = {
+    {ENC1_SW, "ENC1_SW", HIGH, HIGH, 0},
+    {ENC2_SW, "ENC2_SW", HIGH, HIGH, 0},
+    {SW1_PIN, "SW1", HIGH, HIGH, 0},
+    {SW2_PIN, "SW2", HIGH, HIGH, 0},
+    {SW3_PIN, "SW3", HIGH, HIGH, 0},
+    {SW4_PIN, "SW4", HIGH, HIGH, 0},
+};
+static const int NUM_BUTTONS = sizeof(g_buttons) / sizeof(g_buttons[0]);
+
+// Poll one encoder; returns -1/0/+1 DETENTS since the last call.
+static int8_t encoderPoll(Encoder &e)
+{
+    uint8_t curr = (digitalRead(e.pinA) << 1) | digitalRead(e.pinB);
+#if ENC_DEBUG
+    if (curr != e.prev)
+        Serial.printf("[enc-dbg] A(GPIO%u)=%u B(GPIO%u)=%u\n",
+                      e.pinA, (curr >> 1) & 1, e.pinB, curr & 1);
+#endif
+    int8_t d = QUAD_LUT[(e.prev << 2) | curr];
+    e.prev = curr;
+    if (d == 0)
+        return 0;
+    e.accum += d;
+    if (e.accum >= 4)  { e.accum = 0; return +1; }
+    if (e.accum <= -4) { e.accum = 0; return -1; }
+    return 0;
+}
+
+// Debounced press detector; returns true ONCE per fresh press (HIGH->LOW).
+static bool buttonPressed(Button &b)
+{
+    bool raw = digitalRead(b.pin);
+    uint32_t now = millis();
+    if (raw != b.lastRead)
+    {
+        b.lastRead = raw;
+        b.lastEdge = now;
+    }
+    if ((now - b.lastEdge) >= DEBOUNCE_MS && raw != b.stable)
+    {
+        b.stable = raw;
+        if (b.stable == LOW)
+            return true; // just became pressed
+    }
+    return false;
+}
+
+// Configure all input pins and seed the encoder states.
+static void inputInit(void)
+{
+    pinMode(ENC1_A, INPUT_PULLUP);
+    pinMode(ENC1_B, INPUT_PULLUP);
+    pinMode(ENC2_A, INPUT_PULLUP);
+    pinMode(ENC2_B, INPUT_PULLUP);
+    for (int i = 0; i < NUM_BUTTONS; i++)
+        pinMode(g_buttons[i].pin, INPUT_PULLUP);
+
+    g_enc1.prev = (digitalRead(ENC1_A) << 1) | digitalRead(ENC1_B);
+    g_enc2.prev = (digitalRead(ENC2_A) << 1) | digitalRead(ENC2_B);
+
+    Serial.println(F("[input] 2 encoders + 6 buttons ready "
+                     "(INPUT_PULLUP, active-low)."));
+}
+
+// Poll every input and print any activity on serial. Must run every loop pass.
+static void inputPoll(void)
+{
+    int8_t d1 = encoderPoll(g_enc1);
+    if (d1)
+    {
+        g_enc1Pos += d1;
+        Serial.printf("[input] ENC1 %+d -> pos %ld\n", d1, (long)g_enc1Pos);
+    }
+    int8_t d2 = encoderPoll(g_enc2);
+    if (d2)
+    {
+        g_enc2Pos += d2;
+        Serial.printf("[input] ENC2 %+d -> pos %ld\n", d2, (long)g_enc2Pos);
+    }
+    for (int i = 0; i < NUM_BUTTONS; i++)
+        if (buttonPressed(g_buttons[i]))
+            Serial.printf("[input] %s pressed\n", g_buttons[i].name);
+}
+
 // Raw I2C probe (ACK/NACK) independent of the graphics lib.
 static bool i2cProbe(uint8_t addr)
 {
@@ -246,6 +382,9 @@ void setup()
     // Mount the microSD card (dedicated SPI bus) and scan for .mp3 files.
     sdScan();
 
+    // Configure the rotary encoders + keyboard switches.
+    inputInit();
+
     Serial.println(F("[boot] setup done"));
     Serial.println(F("========================================"));
 }
@@ -266,6 +405,10 @@ void loop()
         led = !led;
         digitalWrite(LED_PIN, led);
     }
+
+    // Poll all inputs every pass (encoders need frequent sampling not to miss
+    // steps); activity is printed on serial.
+    inputPoll();
 
     if (g_oledPresent)
     {
