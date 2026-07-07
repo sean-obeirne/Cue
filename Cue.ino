@@ -44,6 +44,7 @@
 #include <esp_log.h>
 #include "MP3DecoderHelix.h"
 #include "freertos/stream_buffer.h"
+#include "esp_heap_caps.h"
 using namespace libhelix;
 
 // On-board LED on most ESP32 DevKitV1 boards is wired to GPIO2.
@@ -75,8 +76,38 @@ static bool g_sdMounted = false;
 static const char *g_sdType = "?";
 static float g_sdSizeMB = 0;
 static int g_mp3Count = 0;    // total .mp3 files found
-static String g_mp3Names[64]; // stored .mp3 filenames (the "Songs" list)
-static int g_mp3Shown = 0;    // how many of g_mp3Names are filled
+static String g_mp3Path[64];  // full path "/dir/song.mp3" for playback + ID3
+static int g_mp3Shown = 0;    // how many tracks are stored
+
+// ---- Per-track ID3 metadata -------------------------------------------------
+// Only the TITLE is kept per-song (for the Songs browse list). Artist/Album/
+// Genre are NOT stored per-song: those parallel String[64] arrays ate the ~8KB
+// of heap the Bluetooth A2DP media stream needs to START (with them, the SBC
+// encoder alloc failed and the stream never began -> silent 2% stall). The
+// unique values below still power the browse lists, and the CURRENT track's
+// artist/album are re-parsed on demand into g_cur* for the now-playing screen.
+static String g_title[64];  // ID3 title (TIT2); empty -> fall back to filename
+
+// Unique aggregated values for the Artists / Albums / Genre browse lists.
+static String g_uArtist[64];
+static int g_uArtistN = 0;
+static String g_uAlbum[64];
+static int g_uAlbumN = 0;
+static String g_uGenre[64];
+static int g_uGenreN = 0;
+
+// Current (now-playing) track metadata, re-parsed when a track starts playing.
+static String g_curTitle;
+static String g_curArtist;
+static String g_curAlbum;
+
+// Now-playing state: which song is playing + decode progress (for the bar).
+static volatile int g_playingIndex = 0;
+static volatile uint32_t g_playPos = 0;  // bytes decoded so far this track
+static volatile uint32_t g_playSize = 1; // total file bytes (1 avoids /0)
+// Diagnostics: how often the A2DP consumer runs + how often it underruns.
+static volatile uint32_t g_a2dpCalls = 0;
+static volatile uint32_t g_a2dpUnderruns = 0;
 
 // ---- Bluetooth A2DP source (streams audio OUT to a BT speaker/headphone) -----
 // Cue is the SOURCE: it connects TO this sink by its advertised name (exact,
@@ -91,8 +122,9 @@ static volatile bool g_btConnected = false;
 // and the PCM is pushed into a FreeRTOS stream buffer. The A2DP data callback
 // (BT task) pulls PCM from that buffer on demand. The buffer decouples the two
 // and lets the decoder self-pace (it blocks when the buffer is full).
-#define PCM_BUF_BYTES (16 * 1024) // ~0.09s of 44.1kHz stereo PCM; kept small to
-                                  // leave heap for the BT stack + MP3 decoder
+#define PCM_BUF_BYTES (8 * 1024)  // ~0.045s of 44.1kHz stereo PCM; kept small
+                                  // so the BT stack keeps enough contiguous
+                                  // heap once A2DP connects (it grabs ~90KB)
 static StreamBufferHandle_t g_pcmBuf = nullptr;
 static String g_firstMp3Path; // full path "/name.mp3" of first track
 static volatile bool g_mp3FormatLogged = false;
@@ -103,8 +135,14 @@ static MP3DecoderHelix g_mp3;
 
 // Press-to-play: path of the track the decode task should play. A char[] (not
 // String) for safe access from both the UI (loop) task and the decode task.
-static char g_playPath[128] = {0};
+static char g_playPath[256] = {0};
 static volatile bool g_trackChanged = false;
+// The decode task is CREATED early (in setup, while ~110KB heap is free) but
+// BLOCKS on this flag until BT is connected + stable. That keeps its 8KB stack
+// reserved from the roomy pre-Bluetooth heap instead of being carved out of the
+// ~12KB that remains once A2DP is connected -> avoids starving the BT stack
+// into an OOM crash (hash_map_set / SbcAnalysisInit asserts).
+static volatile bool g_decodeGo = false;
 
 // ---- Input: 2 rotary encoders (A/B/SW) + 4 keyboard switches ----------------
 // All active-low with internal pull-ups (INPUT_PULLUP): idle HIGH, pressed LOW.
@@ -128,6 +166,10 @@ static volatile bool g_trackChanged = false;
 // TEMP: set to 1 to print every raw A/B transition on the encoders (diagnoses
 // wiring vs decode). Set back to 0 once the encoders are confirmed working.
 #define ENC_DEBUG 0
+
+// TEMP: 1 prints every raw button edge (PRESS/release) so we can confirm a
+// button is electrically registering. Set back to 0 once inputs are trusted.
+#define BTN_DEBUG 0
 
 // Quadrature transition table. Index = (prev<<2)|curr, each 2 bits = (A<<1)|B.
 // Value = direction of that Gray-code transition (-1/0/+1 quarter-step).
@@ -175,25 +217,23 @@ static const int NUM_BUTTONS = sizeof(g_buttons) / sizeof(g_buttons[0]);
 //  Genre/Artists/Albums are PLACEHOLDER lists until ID3 metadata parsing is
 //  added; "Songs" shows the real .mp3 filenames from the SD card.
 // ============================================================================
-static const char *TOP_ITEMS[] = {"Music", "Settings"};
-static const int TOP_N = 2;
+static const char *TOP_ITEMS[] = {"Playing", "Library", "Settings"};
+static const int TOP_N = 3;
 static const char *CAT_ITEMS[] = {"Genre", "Artists", "Albums", "Songs"};
 static const int CAT_N = 4;
 
-static const char *GENRE_ITEMS[] = {"Rock", "Pop", "Jazz", "Hip-Hop",
-                                    "Electronic", "Classical"};
-static const char *ARTIST_ITEMS[] = {"Artist A", "Artist B", "Artist C"};
-static const char *ALBUM_ITEMS[] = {"Album One", "Album Two", "Album Three"};
-
-#define TOP_HIDE_MS 5000
-
-static int g_topIndex = 0; // 0=Music, 1=Settings
-static bool g_topVisible = true;
-static uint32_t g_topLastChange = 0;
+static int g_topIndex = 1;    // view: 0=Playing, 1=Library, 2=Settings
 static int g_catIndex = 3;    // default to Songs so the real library shows
 static int g_listIndex = 0;   // selected row in the current list
 static int g_listTop = 0;     // first visible row (viewport scroll)
 static bool g_uiDirty = true; // set true to request a redraw
+
+// Basename (portion after the last '/') of a full path.
+static String baseName(const String &path)
+{
+    int slash = path.lastIndexOf('/');
+    return (slash >= 0) ? path.substring(slash + 1) : path;
+}
 
 // Item count of the currently selected category's list.
 static int currentListCount(void)
@@ -201,13 +241,13 @@ static int currentListCount(void)
     switch (g_catIndex)
     {
     case 0:
-        return sizeof(GENRE_ITEMS) / sizeof(GENRE_ITEMS[0]);
+        return g_uGenreN; // Genre
     case 1:
-        return sizeof(ARTIST_ITEMS) / sizeof(ARTIST_ITEMS[0]);
+        return g_uArtistN; // Artists
     case 2:
-        return sizeof(ALBUM_ITEMS) / sizeof(ALBUM_ITEMS[0]);
+        return g_uAlbumN; // Albums
     default:
-        return g_mp3Shown; // real songs captured by sdScan
+        return g_mp3Shown; // Songs
     }
 }
 
@@ -217,26 +257,24 @@ static String currentListItem(int i)
     switch (g_catIndex)
     {
     case 0:
-        return GENRE_ITEMS[i];
+        return g_uGenre[i];
     case 1:
-        return ARTIST_ITEMS[i];
+        return g_uArtist[i];
     case 2:
-        return ALBUM_ITEMS[i];
+        return g_uAlbum[i];
     default:
-        return g_mp3Names[i];
+        return g_title[i].length() ? g_title[i] : baseName(g_mp3Path[i]);
     }
 }
 
-// Top banner: SW2/SW3. If the banner is hidden, the FIRST press just re-summons
-// it (no move) so it opens in a single press; once visible, presses move the
-// selection. Either way, restart the 5s auto-hide timer.
+// One-button view switch: cycles Playing -> Library -> Settings -> Playing on
+// EVERY press. There is no on-screen menu bar; the body content itself shows
+// which view you're in.
 static void uiTopMove(int delta)
 {
-    if (g_topVisible)
-        g_topIndex = constrain(g_topIndex + delta, 0, TOP_N - 1);
-    g_topVisible = true;
-    g_topLastChange = millis();
+    g_topIndex = (g_topIndex + delta + TOP_N) % TOP_N;
     g_uiDirty = true;
+    Serial.printf("[ui] view -> %s (idx %d)\n", TOP_ITEMS[g_topIndex], g_topIndex);
 }
 
 // Second banner: switch category and reset the list to the top.
@@ -266,15 +304,19 @@ static void uiListScroll(int delta)
     }
 }
 
-// Encoder-1 push: play the currently selected song (only in the Songs list).
-// Sets the requested path; the decode task picks it up via g_trackChanged.
+// Encoder-1 push: play the currently selected song (only in the Songs list),
+// remember it as the now-playing track, and jump to the Playing view.
 static void uiPlaySelected(void)
 {
     if (g_catIndex == 3 && g_mp3Shown > 0)
     {
-        snprintf(g_playPath, sizeof(g_playPath), "/%s",
-                 g_mp3Names[g_listIndex].c_str());
+        g_playingIndex = g_listIndex;
+        strncpy(g_playPath, g_mp3Path[g_listIndex].c_str(), sizeof(g_playPath) - 1);
+        g_playPath[sizeof(g_playPath) - 1] = 0;
         g_trackChanged = true;
+        loadCurrentMeta(g_listIndex); // refresh now-playing title/artist/album
+        g_topIndex = 0; // jump to the now-playing screen
+        g_uiDirty = true;
         Serial.printf("[mp3] play request: %s\n", g_playPath);
     }
 }
@@ -313,6 +355,10 @@ static bool buttonPressed(Button &b)
     uint32_t now = millis();
     if (raw != b.lastRead)
     {
+#if BTN_DEBUG
+        Serial.printf("[btn-dbg] %s (GPIO%u) %s\n", b.name, b.pin,
+                      raw ? "release" : "PRESS");
+#endif
         b.lastRead = raw;
         b.lastEdge = now;
     }
@@ -363,10 +409,10 @@ static void inputPoll(void)
         {
             const char *nm = g_buttons[i].name;
             Serial.printf("[input] %s pressed\n", nm);
-            if (!strcmp(nm, "SW2"))
-                uiTopMove(+1); // top banner right
-            else if (!strcmp(nm, "SW3"))
-                uiTopMove(-1); // top banner left
+            // SW3 is the sole top-menu control: it cycles Playing -> Library
+            // -> Settings -> Playing. (SW2 is now unused / free for later.)
+            if (!strcmp(nm, "SW3"))
+                uiTopMove(+1);
             else if (!strcmp(nm, "SW1"))
                 uiCatMove(+1); // category right
             else if (!strcmp(nm, "SW4"))
@@ -407,9 +453,50 @@ static bool i2cScan(void)
     return oled;
 }
 
-// Mount the microSD card on the dedicated SPI bus and collect a summary plus
-// the first few .mp3 filenames. Modeled on PocketPage's scanCard(), filtered
-// for .mp3 and ignoring everything else on the card.
+// Recursively collect .mp3 files (with full paths) from `dir`. `prefix` is the
+// directory path with a trailing '/'. Descends into subfolders so a normal
+// music library (Artist/Album/song.mp3) works. Caps at 64 tracks; skips hidden
+// and AppleDouble ("._") entries.
+static void sdScanDir(File dir, const String &prefix)
+{
+    while (g_mp3Shown < 64)
+    {
+        File e = dir.openNextFile();
+        if (!e)
+            break;
+
+        // Basename, regardless of whether name() returns base or a full path.
+        String nm = e.name();
+        int slash = nm.lastIndexOf('/');
+        String base = (slash >= 0) ? nm.substring(slash + 1) : nm;
+
+        if (base.length() == 0 || base.startsWith(".")) // hidden / "._" junk
+        {
+            e.close();
+            continue;
+        }
+
+        if (e.isDirectory())
+        {
+            sdScanDir(e, prefix + base + "/");
+        }
+        else
+        {
+            String lower = base;
+            lower.toLowerCase();
+            if (lower.endsWith(".mp3"))
+            {
+                g_mp3Path[g_mp3Shown] = prefix + base;
+                g_mp3Shown++;
+                g_mp3Count++;
+            }
+        }
+        e.close();
+    }
+}
+
+// Mount the microSD card on the dedicated SPI bus, then recursively scan for
+// .mp3 files (including inside folders) and gather a summary.
 static void sdScan(void)
 {
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -442,39 +529,191 @@ static void sdScan(void)
     File root = SD.open("/");
     if (root)
     {
-        for (File e = root.openNextFile(); e; e = root.openNextFile())
-        {
-            if (!e.isDirectory())
-            {
-                String n = e.name();
-                String lower = n;
-                lower.toLowerCase();
-                if (lower.endsWith(".mp3")) // ignore the non-mp3 files
-                {
-                    if (g_mp3Count == 0)
-                    {
-                        // Remember the first track's full path for playback.
-                        g_firstMp3Path = n.startsWith("/") ? n : ("/" + n);
-                    }
-                    if (g_mp3Shown < 64)
-                    {
-                        String disp = n;
-                        if (disp.startsWith("/"))
-                            disp = disp.substring(1);
-                        g_mp3Names[g_mp3Shown++] = disp;
-                    }
-                    g_mp3Count++;
-                }
-            }
-            e.close();
-        }
+        sdScanDir(root, "/"); // recurse into folders too
         root.close();
     }
+    if (g_mp3Shown > 0)
+        g_firstMp3Path = g_mp3Path[0];
 
     Serial.printf("[sd] OK: %s, %.0f MB, %d mp3 file(s)\n",
                   g_sdType, g_sdSizeMB, g_mp3Count);
     for (int i = 0; i < g_mp3Shown; i++)
-        Serial.printf("[sd]   - %s\n", g_mp3Names[i].c_str());
+        Serial.printf("[sd]   - %s\n", g_mp3Path[i].c_str());
+}
+
+// ---- ID3 tag parsing --------------------------------------------------------
+// Minimal ID3v2 (v2.2/2.3/2.4) reader: pulls title/artist/album/genre. Large
+// frames (e.g. album art) are skipped via seek, so it stays fast.
+
+// Add a value to a unique-string list (skips empties + duplicates).
+static void addUnique(String *arr, int &n, const String &v)
+{
+    if (v.length() == 0 || n >= 64)
+        return;
+    for (int i = 0; i < n; i++)
+        if (arr[i] == v)
+            return;
+    arr[n++] = v;
+}
+
+// 4-byte syncsafe integer (7 bits per byte) used by ID3v2 sizes.
+static uint32_t id3SyncSafe(const uint8_t *p)
+{
+    return ((uint32_t)(p[0] & 0x7f) << 21) | ((uint32_t)(p[1] & 0x7f) << 14) |
+           ((uint32_t)(p[2] & 0x7f) << 7) | (uint32_t)(p[3] & 0x7f);
+}
+
+// Read a text frame body of `size` bytes at the current position, decoding the
+// leading encoding byte (0=Latin1, 1=UTF-16+BOM, 2=UTF-16BE, 3=UTF-8). Returns
+// best-effort ASCII.
+static String id3ReadText(File &f, uint32_t size)
+{
+    if (size == 0)
+        return String();
+    int enc = f.read();
+    int remaining = (int)size - 1;
+    String s;
+    if (enc == 1)
+    {
+        int b0 = f.read();
+        int b1 = f.read();
+        remaining -= 2;
+        bool le = !(b0 == 0xFE && b1 == 0xFF); // BE only if BOM says so
+        while (remaining >= 2)
+        {
+            int x = f.read();
+            int y = f.read();
+            remaining -= 2;
+            int c = le ? x : y;
+            if (c >= 32 && c < 127)
+                s += (char)c;
+        }
+    }
+    else if (enc == 2)
+    {
+        while (remaining >= 2)
+        {
+            f.read();         // high byte (0 for ASCII)
+            int c = f.read(); // low byte
+            remaining -= 2;
+            if (c >= 32 && c < 127)
+                s += (char)c;
+        }
+    }
+    else // 0 (Latin-1) or 3 (UTF-8)
+    {
+        for (int i = 0; i < remaining; i++)
+        {
+            int c = f.read();
+            if (c >= 32)
+                s += (char)c;
+        }
+    }
+    s.trim();
+    return s;
+}
+
+// Parse ID3v2 text frames of `path` into the provided output strings. A frame
+// that is absent is left untouched, so callers should pre-clear the outputs.
+static void parseID3(const char *path, String &title, String &artist,
+                     String &album, String &genre)
+{
+    File f = SD.open(path, FILE_READ);
+    if (!f)
+        return;
+    uint8_t hdr[10];
+    if (f.read(hdr, 10) == 10 && memcmp(hdr, "ID3", 3) == 0)
+    {
+        uint8_t major = hdr[3];
+        uint32_t tagSize = id3SyncSafe(hdr + 6);
+        bool v22 = (major == 2);
+        uint32_t frameHdrLen = v22 ? 6 : 10;
+        uint32_t pos = 10;             // first frame
+        uint32_t end = 10 + tagSize;   // end of the tag
+        while (pos + frameHdrLen <= end)
+        {
+            f.seek(pos);
+            uint8_t fh[10];
+            if ((uint32_t)f.read(fh, frameHdrLen) != frameHdrLen)
+                break;
+            char id[5] = {0};
+            uint32_t fsize;
+            if (v22)
+            {
+                memcpy(id, fh, 3);
+                fsize = ((uint32_t)fh[3] << 16) | ((uint32_t)fh[4] << 8) | fh[5];
+            }
+            else
+            {
+                memcpy(id, fh, 4);
+                if (major == 4)
+                    fsize = id3SyncSafe(fh + 4);
+                else
+                    fsize = ((uint32_t)fh[4] << 24) | ((uint32_t)fh[5] << 16) |
+                            ((uint32_t)fh[6] << 8) | fh[7];
+            }
+            if (id[0] < 'A' || id[0] > 'Z' || fsize == 0 || fsize > end)
+                break; // padding or garbage -> stop
+            uint32_t content = pos + frameHdrLen;
+            String *dst = nullptr;
+            if (v22)
+            {
+                if (!strcmp(id, "TT2")) dst = &title;
+                else if (!strcmp(id, "TP1")) dst = &artist;
+                else if (!strcmp(id, "TAL")) dst = &album;
+                else if (!strcmp(id, "TCO")) dst = &genre;
+            }
+            else
+            {
+                if (!strcmp(id, "TIT2")) dst = &title;
+                else if (!strcmp(id, "TPE1")) dst = &artist;
+                else if (!strcmp(id, "TALB")) dst = &album;
+                else if (!strcmp(id, "TCON")) dst = &genre;
+            }
+            if (dst)
+            {
+                f.seek(content);
+                *dst = id3ReadText(f, fsize);
+            }
+            pos = content + fsize;
+        }
+    }
+    f.close();
+}
+
+// Re-parse the CURRENT track's tags into g_cur* (called on track select + boot).
+// Runs in loop/UI context (same thread as drawNowPlaying) so no cross-task race.
+static void loadCurrentMeta(int idx)
+{
+    g_curTitle = "";
+    g_curArtist = "";
+    g_curAlbum = "";
+    if (idx < 0 || idx >= g_mp3Shown)
+        return;
+    String genre;
+    parseID3(g_mp3Path[idx].c_str(), g_curTitle, g_curArtist, g_curAlbum, genre);
+    if (!g_curTitle.length())
+        g_curTitle = g_title[idx].length() ? g_title[idx] : baseName(g_mp3Path[idx]);
+}
+
+// Parse every song's tags: keep the title per-song and build the unique
+// Artist/Album/Genre browse lists (artist/album/genre are NOT kept per-song).
+static void scanMetadata(void)
+{
+    Serial.println(F("[meta] parsing ID3 tags..."));
+    for (int i = 0; i < g_mp3Shown; i++)
+    {
+        String title, artist, album, genre;
+        parseID3(g_mp3Path[i].c_str(), title, artist, album, genre);
+        g_title[i] = title;
+        addUnique(g_uArtist, g_uArtistN, artist);
+        addUnique(g_uAlbum, g_uAlbumN, album);
+        addUnique(g_uGenre, g_uGenreN, genre);
+    }
+    if (g_mp3Shown > 0)
+        loadCurrentMeta(0); // prime now-playing for the default track
+    Serial.printf("[meta] %d songs, %d artists, %d albums, %d genres\n",
+                  g_mp3Shown, g_uArtistN, g_uAlbumN, g_uGenreN);
 }
 
 // PCM callback from the Helix MP3 decoder (runs on the decode task): push the
@@ -500,12 +739,18 @@ static void mp3PcmCallback(MP3FrameInfo &info, short *pcm, size_t len, void *ref
 // the stream never stalls.
 static int32_t a2dpPcmCallback(Frame *frames, int32_t frameCount)
 {
+    if (frameCount <= 0)
+        return 0; // defensive: never compute a bogus (huge) memset length
+    g_a2dpCalls++;
     size_t wanted = (size_t)frameCount * sizeof(Frame); // Frame = L+R int16 = 4B
     size_t got = 0;
     if (g_pcmBuf)
         got = xStreamBufferReceive(g_pcmBuf, frames, wanted, 0); // non-blocking
     if (got < wanted)
+    {
+        g_a2dpUnderruns++;
         memset((uint8_t *)frames + got, 0, wanted - got); // silence on underrun
+    }
     return frameCount;
 }
 
@@ -517,10 +762,17 @@ static void mp3DecodeTask(void *param)
     const size_t CHUNK = 1024;
     uint8_t inbuf[CHUNK];
 
+    // Block until loop() confirms the A2DP link is up + stable. The task exists
+    // (stack already allocated from the plentiful pre-BT heap) but must not
+    // decode or push PCM until the consumer exists AND the BT stack has
+    // finished its own start-up allocations, or we starve it into an OOM crash.
+    while (!g_decodeGo)
+        vTaskDelay(pdMS_TO_TICKS(50));
+
     for (;;)
     {
         // Snapshot the requested path (char[] -> safe across tasks).
-        char path[128];
+        char path[256];
         strncpy(path, g_playPath, sizeof(path) - 1);
         path[sizeof(path) - 1] = 0;
         g_trackChanged = false;
@@ -534,21 +786,30 @@ static void mp3DecodeTask(void *param)
         }
         Serial.printf("[mp3] playing %s (%u bytes)\n", path, (unsigned)f.size());
         g_mp3FormatLogged = false; // re-log the format for the new track
+        g_playSize = f.size() ? f.size() : 1;
+        g_playPos = 0;
 
         // Stream the file, but bail out early if a new track was requested.
         while (f.available() && !g_trackChanged)
         {
             int n = f.read(inbuf, CHUNK);
             if (n > 0)
+            {
                 g_mp3.write(inbuf, n); // -> mp3PcmCallback -> ring buffer
+                g_playPos += n;
+            }
         }
         f.close();
 
         if (g_trackChanged)
         {
-            // Drop stale buffered audio so the new song starts promptly.
-            if (g_pcmBuf)
-                xStreamBufferReset(g_pcmBuf);
+            // Do NOT xStreamBufferReset() here: the BT (consumer) task may be
+            // reading this buffer concurrently on the other core, and a reset
+            // racing a receive corrupts the buffer's internal state -> heap
+            // corruption -> random BT-stack asserts (SbcAnalysisInit /
+            // hash_map_set). The ~90ms of already-buffered audio (16KB) simply
+            // plays out before the new track begins; that brief tail is
+            // imperceptible and, crucially, race-free.
             Serial.println(F("[mp3] switching track"));
         }
         else
@@ -558,39 +819,9 @@ static void mp3DecodeTask(void *param)
     }
 }
 
-// Render the two-level menu UI. This is a full-buffer redraw, but it is only
-// called when the UI state actually changes (input / BT / banner auto-hide),
-// so there is no per-frame flicker (the lesson from Step 2).
-static void drawUI(void)
+// --- Library view: category tabs (persistent) + scrollable list ---
+static void drawLibrary(int16_t y)
 {
-    u8g2.clearBuffer();
-    int16_t y = 0;
-
-    // --- Top banner: Music / Settings (auto-hides after 5s) ---
-    if (g_topVisible)
-    {
-        u8g2.setFont(u8g2_font_5x7_tr);
-        int16_t x = 1;
-        for (int i = 0; i < TOP_N; i++)
-        {
-            int16_t w = u8g2.getStrWidth(TOP_ITEMS[i]) + 3;
-            if (i == g_topIndex)
-            {
-                u8g2.drawBox(x, 0, w, 9);
-                u8g2.setDrawColor(0);
-                u8g2.drawStr(x + 1, 7, TOP_ITEMS[i]);
-                u8g2.setDrawColor(1);
-            }
-            else
-                u8g2.drawStr(x + 1, 7, TOP_ITEMS[i]);
-            x += w + 2;
-        }
-        u8g2.drawHLine(0, 10, 128);
-        y = 12;
-    }
-
-    // --- Second banner: category tabs (persistent). Same 5x7 font as the top
-    //     banner so the two menus look uniform. ---
     u8g2.setFont(u8g2_font_5x7_tr);
     {
         int16_t x = 1;
@@ -613,7 +844,6 @@ static void drawUI(void)
     u8g2.drawHLine(0, y, 128);
     y += 2;
 
-    // --- List area: encoder-1 scroll, '>' marks the selection ---
     int count = currentListCount();
     const int rowH = 10;
     u8g2.setFont(u8g2_font_6x10_tr);
@@ -644,6 +874,80 @@ static void drawUI(void)
                 item = item.substring(0, 19);
             u8g2.drawStr(8, ry, item.c_str());
         }
+}
+
+// --- Now-playing view: title, artist - album, progress bar, status ---
+static void drawNowPlaying(int16_t y)
+{
+    int16_t top = y;
+
+    String title = "(no track)";
+    String artist = "Unknown Artist";
+    String album = "Unknown Album";
+    if (g_mp3Shown > 0)
+    {
+        if (g_curTitle.length())
+            title = g_curTitle;
+        if (g_curArtist.length())
+            artist = g_curArtist;
+        if (g_curAlbum.length())
+            album = g_curAlbum;
+    }
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+    if (title.length() > 20)
+        title = title.substring(0, 20);
+    u8g2.drawStr(2, top + 11, title.c_str());
+
+    u8g2.setFont(u8g2_font_5x7_tr);
+    String aa = artist + " - " + album;
+    if (aa.length() > 24)
+        aa = aa.substring(0, 24);
+    u8g2.drawStr(2, top + 22, aa.c_str());
+
+    // Progress bar (decode position through the file).
+    int16_t by = top + 27;
+    u8g2.drawFrame(2, by, 124, 7);
+    float frac = (float)g_playPos / (float)g_playSize;
+    if (frac < 0)
+        frac = 0;
+    if (frac > 1)
+        frac = 1;
+    int16_t fw = (int16_t)(120 * frac);
+    if (fw > 0)
+        u8g2.drawBox(4, by + 2, fw, 3);
+
+    // Status line: percent + BT connection state.
+    char st[32];
+    snprintf(st, sizeof(st), "%d%%   %s", (int)(frac * 100),
+             g_btConnected ? "BT ok" : "BT ...");
+    u8g2.drawStr(2, top + 45, st);
+}
+
+// --- Settings view: placeholder ---
+static void drawSettings(int16_t y)
+{
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(4, y + 14, "Settings");
+    u8g2.setFont(u8g2_font_5x7_tr);
+    u8g2.drawStr(4, y + 28, "(coming soon)");
+    u8g2.drawStr(4, y + 40, "Sink: " BT_SINK_NAME);
+}
+
+// Render the whole UI. Full-buffer redraw, called only when state changes
+// (input / BT / banner hide / now-playing progress) -> no per-frame flicker.
+static void drawUI(void)
+{
+    u8g2.clearBuffer();
+
+    // No menu bar: the selected view uses the whole screen. The body content
+    // (now-playing / category tabs / settings) tells you which view you're in.
+    if (g_topIndex == 0)
+        drawNowPlaying(0);
+    else if (g_topIndex == 2)
+        drawSettings(0);
+    else
+        drawLibrary(0);
 
     u8g2.sendBuffer(); // single full-buffer push
 }
@@ -685,6 +989,9 @@ void setup()
     // Mount the microSD card (dedicated SPI bus) and scan for .mp3 files.
     sdScan();
 
+    // Parse ID3 tags to populate song titles + the Artist/Album/Genre lists.
+    scanMetadata();
+
     // Configure the rotary encoders + keyboard switches.
     inputInit();
 
@@ -703,6 +1010,14 @@ void setup()
                           ESP.getFreeHeap());
         else
             Serial.println(F("[mp3] decoder begin FAILED (out of memory)"));
+
+        // Create the decode task NOW, while heap is plentiful (~110KB). It
+        // blocks on g_decodeGo until loop() sees a stable BT link, so its 8KB
+        // stack comes from the roomy pre-Bluetooth heap rather than the ~12KB
+        // left once A2DP is connected (carving it out post-connect starved the
+        // BT stack -> hash_map_set / SbcAnalysisInit OOM asserts).
+        xTaskCreatePinnedToCore(mp3DecodeTask, "mp3dec", 8192, nullptr, 5,
+                                nullptr, 1);
     }
     else
         Serial.println(F("[mp3] no track to play (card/mp3 missing) -> silence"));
@@ -722,10 +1037,6 @@ void setup()
     Serial.printf("[bt] A2DP source start -> connecting to \"%s\"...\n",
                   BT_SINK_NAME);
     a2dp_source.start(BT_SINK_NAME, a2dpPcmCallback);
-
-    // Start the top-banner 5s auto-hide timer now that boot is done (setup
-    // blocks ~10s in BT init, so millis() is already >5s by the first loop).
-    g_topLastChange = millis();
 
     Serial.println(F("[boot] setup done"));
     Serial.println(F("========================================"));
@@ -776,15 +1087,50 @@ void loop()
     // before a consumer exists is pointless, and it keeps heavy decode load away
     // from the power-sensitive BT connect phase (where the reset loop appeared).
     {
-        static bool decodeStarted = false;
-        if (!decodeStarted && a2dp_source.is_connected() &&
+        static bool decodeReleased = false;
+        static uint32_t connectedSince = 0;
+        bool btUp = a2dp_source.is_connected();
+        if (!btUp)
+            connectedSince = 0;
+        else if (connectedSince == 0)
+            connectedSince = now;
+        // Release the (already-created, blocked) decode task once the A2DP link
+        // has been up ~800ms, letting the BT stack finish its own start-up
+        // allocations first. We only flip a flag here -> NO late heap allocation
+        // that would fragment the little heap the BT stack left us.
+        if (!decodeReleased && btUp && connectedSince &&
+            (now - connectedSince >= 800) &&
             g_pcmBuf && g_sdMounted && g_mp3Count > 0)
         {
-            decodeStarted = true;
-            Serial.printf("[mp3] BT connected -> starting decode task for %s\n",
-                          g_firstMp3Path.c_str());
-            xTaskCreatePinnedToCore(mp3DecodeTask, "mp3dec", 8192, nullptr, 5,
-                                    nullptr, 1);
+            decodeReleased = true;
+            g_decodeGo = true;
+            Serial.printf("[mp3] BT stable -> decode go "
+                          "(free heap %u, largest block %u)\n",
+                          (unsigned)ESP.getFreeHeap(),
+                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        }
+    }
+
+    // 1Hz pipeline diagnostic: shows whether the decode task is feeding (pos
+    // climbing, buf > 0) and whether the BT consumer is pulling (a2dp delta > 0)
+    // vs underrunning (under delta high). Frozen pos + full buf + a2dp=0 => BT
+    // stopped pulling; frozen pos + empty buf => decode task hung/died.
+    {
+        static uint32_t lastDbg = 0;
+        static uint32_t lastCalls = 0, lastUnder = 0;
+        if (g_decodeGo && (now - lastDbg >= 1000))
+        {
+            lastDbg = now;
+            uint32_t calls = g_a2dpCalls, under = g_a2dpUnderruns;
+            unsigned bufAvail = g_pcmBuf ? (unsigned)xStreamBufferBytesAvailable(g_pcmBuf) : 0;
+            int pct = g_playSize ? (int)((uint64_t)g_playPos * 100 / g_playSize) : 0;
+            Serial.printf("[dbg] pos=%u/%u (%d%%) buf=%u/%u a2dp=+%u under=+%u conn=%d\n",
+                          (unsigned)g_playPos, (unsigned)g_playSize, pct,
+                          bufAvail, (unsigned)PCM_BUF_BYTES,
+                          (unsigned)(calls - lastCalls), (unsigned)(under - lastUnder),
+                          a2dp_source.is_connected() ? 1 : 0);
+            lastCalls = calls;
+            lastUnder = under;
         }
     }
 
@@ -802,10 +1148,12 @@ void loop()
                                             : "not connected (scanning/pairing)");
         }
 
-        // Auto-hide the top banner after 5s of no SW2/SW3 interaction.
-        if (g_topVisible && (now - g_topLastChange >= TOP_HIDE_MS))
+        // While the now-playing view is up, refresh ~1x/sec so the progress
+        // bar advances (slow enough that the redraw stays flicker-free).
+        static uint32_t lastNpRefresh = 0;
+        if (g_topIndex == 0 && (now - lastNpRefresh >= 1000))
         {
-            g_topVisible = false;
+            lastNpRefresh = now;
             g_uiDirty = true;
         }
 
