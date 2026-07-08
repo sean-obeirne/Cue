@@ -105,9 +105,6 @@ static String g_curAlbum;
 static volatile int g_playingIndex = 0;
 static volatile uint32_t g_playPos = 0;  // bytes decoded so far this track
 static volatile uint32_t g_playSize = 1; // total file bytes (1 avoids /0)
-// Diagnostics: how often the A2DP consumer runs + how often it underruns.
-static volatile uint32_t g_a2dpCalls = 0;
-static volatile uint32_t g_a2dpUnderruns = 0;
 
 // ---- Bluetooth A2DP source (streams audio OUT to a BT speaker/headphone) -----
 // Cue is the SOURCE: it connects TO this sink by its advertised name (exact,
@@ -741,16 +738,12 @@ static int32_t a2dpPcmCallback(Frame *frames, int32_t frameCount)
 {
     if (frameCount <= 0)
         return 0; // defensive: never compute a bogus (huge) memset length
-    g_a2dpCalls++;
     size_t wanted = (size_t)frameCount * sizeof(Frame); // Frame = L+R int16 = 4B
     size_t got = 0;
     if (g_pcmBuf)
         got = xStreamBufferReceive(g_pcmBuf, frames, wanted, 0); // non-blocking
     if (got < wanted)
-    {
-        g_a2dpUnderruns++;
         memset((uint8_t *)frames + got, 0, wanted - got); // silence on underrun
-    }
     return frameCount;
 }
 
@@ -1108,29 +1101,6 @@ void loop()
                           "(free heap %u, largest block %u)\n",
                           (unsigned)ESP.getFreeHeap(),
                           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-        }
-    }
-
-    // 1Hz pipeline diagnostic: shows whether the decode task is feeding (pos
-    // climbing, buf > 0) and whether the BT consumer is pulling (a2dp delta > 0)
-    // vs underrunning (under delta high). Frozen pos + full buf + a2dp=0 => BT
-    // stopped pulling; frozen pos + empty buf => decode task hung/died.
-    {
-        static uint32_t lastDbg = 0;
-        static uint32_t lastCalls = 0, lastUnder = 0;
-        if (g_decodeGo && (now - lastDbg >= 1000))
-        {
-            lastDbg = now;
-            uint32_t calls = g_a2dpCalls, under = g_a2dpUnderruns;
-            unsigned bufAvail = g_pcmBuf ? (unsigned)xStreamBufferBytesAvailable(g_pcmBuf) : 0;
-            int pct = g_playSize ? (int)((uint64_t)g_playPos * 100 / g_playSize) : 0;
-            Serial.printf("[dbg] pos=%u/%u (%d%%) buf=%u/%u a2dp=+%u under=+%u conn=%d\n",
-                          (unsigned)g_playPos, (unsigned)g_playSize, pct,
-                          bufAvail, (unsigned)PCM_BUF_BYTES,
-                          (unsigned)(calls - lastCalls), (unsigned)(under - lastUnder),
-                          a2dp_source.is_connected() ? 1 : 0);
-            lastCalls = calls;
-            lastUnder = under;
         }
     }
 
