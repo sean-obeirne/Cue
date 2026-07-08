@@ -45,6 +45,7 @@
 #include "MP3DecoderHelix.h"
 #include "freertos/stream_buffer.h"
 #include "esp_heap_caps.h"
+#include "driver/gpio.h"
 using namespace libhelix;
 
 // On-board LED on most ESP32 DevKitV1 boards is wired to GPIO2.
@@ -75,9 +76,9 @@ static bool g_oledPresent = false; // set true once 0x3C ACKs; gates drawing.
 static bool g_sdMounted = false;
 static const char *g_sdType = "?";
 static float g_sdSizeMB = 0;
-static int g_mp3Count = 0;    // total .mp3 files found
-static String g_mp3Path[64];  // full path "/dir/song.mp3" for playback + ID3
-static int g_mp3Shown = 0;    // how many tracks are stored
+static int g_mp3Count = 0;   // total .mp3 files found
+static String g_mp3Path[64]; // full path "/dir/song.mp3" for playback + ID3
+static int g_mp3Shown = 0;   // how many tracks are stored
 
 // ---- Per-track ID3 metadata -------------------------------------------------
 // Only the TITLE is kept per-song (for the Songs browse list). Artist/Album/
@@ -86,7 +87,7 @@ static int g_mp3Shown = 0;    // how many tracks are stored
 // encoder alloc failed and the stream never began -> silent 2% stall). The
 // unique values below still power the browse lists, and the CURRENT track's
 // artist/album are re-parsed on demand into g_cur* for the now-playing screen.
-static String g_title[64];  // ID3 title (TIT2); empty -> fall back to filename
+static String g_title[64]; // ID3 title (TIT2); empty -> fall back to filename
 
 // Unique aggregated values for the Artists / Albums / Genre browse lists.
 static String g_uArtist[64];
@@ -103,8 +104,14 @@ static String g_curAlbum;
 
 // Now-playing state: which song is playing + decode progress (for the bar).
 static volatile int g_playingIndex = 0;
-static volatile uint32_t g_playPos = 0;  // bytes decoded so far this track
-static volatile uint32_t g_playSize = 1; // total file bytes (1 avoids /0)
+static volatile uint32_t g_playPos = 0;      // bytes decoded so far this track
+static volatile uint32_t g_playSize = 1;     // total file bytes (1 avoids /0)
+static volatile uint32_t g_trackStartMs = 0; // millis() when current track began
+
+// Volume state (A2DP 0..127). Encoder-2 rotate adjusts; its push toggles mute.
+#define VOL_STEP 1
+static int g_volume = 100; // current volume level (0..127)
+static bool g_muted = false;
 
 // ---- Bluetooth A2DP source (streams audio OUT to a BT speaker/headphone) -----
 // Cue is the SOURCE: it connects TO this sink by its advertised name (exact,
@@ -119,9 +126,9 @@ static volatile bool g_btConnected = false;
 // and the PCM is pushed into a FreeRTOS stream buffer. The A2DP data callback
 // (BT task) pulls PCM from that buffer on demand. The buffer decouples the two
 // and lets the decoder self-pace (it blocks when the buffer is full).
-#define PCM_BUF_BYTES (8 * 1024)  // ~0.045s of 44.1kHz stereo PCM; kept small
-                                  // so the BT stack keeps enough contiguous
-                                  // heap once A2DP connects (it grabs ~90KB)
+#define PCM_BUF_BYTES (8 * 1024) // ~0.045s of 44.1kHz stereo PCM; kept small
+                                 // so the BT stack keeps enough contiguous
+                                 // heap once A2DP connects (it grabs ~90KB)
 static StreamBufferHandle_t g_pcmBuf = nullptr;
 static String g_firstMp3Path; // full path "/name.mp3" of first track
 static volatile bool g_mp3FormatLogged = false;
@@ -170,7 +177,9 @@ static volatile bool g_decodeGo = false;
 
 // Quadrature transition table. Index = (prev<<2)|curr, each 2 bits = (A<<1)|B.
 // Value = direction of that Gray-code transition (-1/0/+1 quarter-step).
-static const int8_t QUAD_LUT[16] = {
+// DRAM_ATTR keeps it in RAM so the IRAM encoder ISR can read it even if the
+// flash cache is momentarily disabled.
+static DRAM_ATTR const int8_t QUAD_LUT[16] = {
     0, -1, 1, 0,
     1, 0, 0, -1,
     -1, 0, 0, 1,
@@ -179,8 +188,9 @@ static const int8_t QUAD_LUT[16] = {
 struct Encoder
 {
     uint8_t pinA, pinB;
-    uint8_t prev; // last (A<<1)|B reading
-    int8_t accum; // accumulated quarter-steps; one detent = 4
+    volatile uint8_t prev;  // last (A<<1)|B reading (updated in the ISR)
+    volatile int8_t accum;  // accumulated quarter-steps; one detent = 4
+    volatile int16_t steps; // completed detents pending, drained by inputPoll
 };
 
 struct Button
@@ -192,8 +202,8 @@ struct Button
     uint32_t lastEdge; // millis() of last raw change
 };
 
-static Encoder g_enc1 = {ENC1_A, ENC1_B, 0, 0};
-static Encoder g_enc2 = {ENC2_A, ENC2_B, 0, 0};
+static Encoder g_enc1 = {ENC1_A, ENC1_B, 0, 0, 0};
+static Encoder g_enc2 = {ENC2_A, ENC2_B, 0, 0, 0};
 static int32_t g_enc1Pos = 0, g_enc2Pos = 0;
 
 static Button g_buttons[] = {
@@ -274,17 +284,13 @@ static void uiTopMove(int delta)
     Serial.printf("[ui] view -> %s (idx %d)\n", TOP_ITEMS[g_topIndex], g_topIndex);
 }
 
-// Second banner: switch category and reset the list to the top.
+// Second banner: cycle category (wraps) and reset the list to the top.
 static void uiCatMove(int delta)
 {
-    int ni = constrain(g_catIndex + delta, 0, CAT_N - 1);
-    if (ni != g_catIndex)
-    {
-        g_catIndex = ni;
-        g_listIndex = 0;
-        g_listTop = 0;
-        g_uiDirty = true;
-    }
+    g_catIndex = ((g_catIndex + delta) % CAT_N + CAT_N) % CAT_N; // wrap/cycle
+    g_listIndex = 0;
+    g_listTop = 0;
+    g_uiDirty = true;
 }
 
 // Encoder-1 list scroll: +1 = down, -1 = up.
@@ -301,48 +307,113 @@ static void uiListScroll(int delta)
     }
 }
 
-// Encoder-1 push: play the currently selected song (only in the Songs list),
-// remember it as the now-playing track, and jump to the Playing view.
+// Start playing the track at global song index `idx` (wraps around the library).
+// Shared by encoder-1 select and the SW1/SW4 next/prev skip controls. Only
+// touches g_playPath (char[]) + g_trackChanged, which the decode task reads.
+static void playTrackIndex(int idx)
+{
+    if (g_mp3Shown <= 0)
+        return;
+    idx = ((idx % g_mp3Shown) + g_mp3Shown) % g_mp3Shown; // wrap both directions
+    g_playingIndex = idx;
+    strncpy(g_playPath, g_mp3Path[idx].c_str(), sizeof(g_playPath) - 1);
+    g_playPath[sizeof(g_playPath) - 1] = 0;
+    g_trackChanged = true;
+    loadCurrentMeta(idx); // refresh now-playing title/artist/album
+    g_topIndex = 0;       // jump to the now-playing screen
+    g_uiDirty = true;
+    Serial.printf("[mp3] play request: %s\n", g_playPath);
+}
+
+// Encoder-1 push: play the currently selected song (only in the Songs list).
 static void uiPlaySelected(void)
 {
     if (g_catIndex == 3 && g_mp3Shown > 0)
-    {
-        g_playingIndex = g_listIndex;
-        strncpy(g_playPath, g_mp3Path[g_listIndex].c_str(), sizeof(g_playPath) - 1);
-        g_playPath[sizeof(g_playPath) - 1] = 0;
-        g_trackChanged = true;
-        loadCurrentMeta(g_listIndex); // refresh now-playing title/artist/album
-        g_topIndex = 0; // jump to the now-playing screen
-        g_uiDirty = true;
-        Serial.printf("[mp3] play request: %s\n", g_playPath);
-    }
+        playTrackIndex(g_listIndex);
 }
 
-// Poll one encoder; returns -1/0/+1 DETENTS since the last call.
-static int8_t encoderPoll(Encoder &e)
+// SW1 (now-playing): skip forward one track (wraps around the library).
+static void uiNextTrack(void) { playTrackIndex(g_playingIndex + 1); }
+
+// SW4 (now-playing): rewind, iPod-style. Within the first 5s of a track it
+// jumps to the PREVIOUS track; after 5s it restarts the current one.
+static void uiRewind(void)
 {
-    uint8_t curr = (digitalRead(e.pinA) << 1) | digitalRead(e.pinB);
-#if ENC_DEBUG
-    if (curr != e.prev)
-        Serial.printf("[enc-dbg] A(GPIO%u)=%u B(GPIO%u)=%u\n",
-                      e.pinA, (curr >> 1) & 1, e.pinB, curr & 1);
-#endif
+    if (g_mp3Shown <= 0)
+        return;
+    if (millis() - g_trackStartMs < 5000)
+        playTrackIndex(g_playingIndex - 1); // early -> previous track
+    else
+        playTrackIndex(g_playingIndex); // late -> restart current track
+}
+
+// Encoder-2: A2DP volume (0..127). set_volume() scales the outgoing PCM in
+// software AND, if the sink supports AVRCP absolute volume, sets the speaker
+// directly. Its push toggles mute.
+static void applyVolume(void)
+{
+    a2dp_source.set_volume(g_muted ? 0 : (uint8_t)g_volume);
+    g_uiDirty = true;
+}
+static void uiVolume(int delta)
+{
+    if (g_muted)
+        g_muted = false; // any twist unmutes
+    g_volume = constrain(g_volume + delta * VOL_STEP, 0, 127);
+    applyVolume();
+    Serial.printf("[vol] %d/127\n", g_volume);
+}
+static void uiToggleMute(void)
+{
+    g_muted = !g_muted;
+    applyVolume();
+    Serial.printf("[vol] %s\n", g_muted ? "MUTED" : "unmuted");
+}
+
+// Interrupt-driven quadrature decode. Reading the encoders in the main loop
+// missed edges whenever the loop stalled (e.g. the ~25ms OLED I2C redraw) and
+// discarded fast multi-step turns as illegal "jumps". Instead we decode EVERY
+// A/B edge in a GPIO ISR (immune to loop timing) and queue completed detents in
+// e.steps; inputPoll() drains them. A portMUX guards the ISR<->loop handoff (the
+// two cores can touch e.steps concurrently). gpio_get_level() is IRAM-safe
+// (unlike digitalRead), so it is safe to call from the IRAM ISR.
+static portMUX_TYPE g_encMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void IRAM_ATTR encoderISR(Encoder &e)
+{
+    uint8_t curr = (gpio_get_level((gpio_num_t)e.pinA) << 1) |
+                   gpio_get_level((gpio_num_t)e.pinB);
+    portENTER_CRITICAL_ISR(&g_encMux);
     int8_t d = QUAD_LUT[(e.prev << 2) | curr];
     e.prev = curr;
-    if (d == 0)
-        return 0;
-    e.accum += d;
-    if (e.accum >= 4)
+    if (d)
     {
-        e.accum = 0;
-        return +1;
+        e.accum += d;
+        if (e.accum >= 4)
+        {
+            e.accum = 0;
+            e.steps++;
+        }
+        else if (e.accum <= -4)
+        {
+            e.accum = 0;
+            e.steps--;
+        }
     }
-    if (e.accum <= -4)
-    {
-        e.accum = 0;
-        return -1;
-    }
-    return 0;
+    portEXIT_CRITICAL_ISR(&g_encMux);
+}
+static void IRAM_ATTR enc1ISR() { encoderISR(g_enc1); }
+static void IRAM_ATTR enc2ISR() { encoderISR(g_enc2); }
+
+// Atomically take + clear the detents accumulated since the last call. Magnitude
+// may be >1 after a fast turn or a long loop stall — all of them are applied.
+static int encoderTake(Encoder &e)
+{
+    portENTER_CRITICAL(&g_encMux);
+    int s = e.steps;
+    e.steps = 0;
+    portEXIT_CRITICAL(&g_encMux);
+    return s;
 }
 
 // Debounced press detector; returns true ONCE per fresh press (HIGH->LOW).
@@ -381,6 +452,13 @@ static void inputInit(void)
     g_enc1.prev = (digitalRead(ENC1_A) << 1) | digitalRead(ENC1_B);
     g_enc2.prev = (digitalRead(ENC2_A) << 1) | digitalRead(ENC2_B);
 
+    // Decode the encoders in GPIO ISRs so no edge is ever missed (loop stalls /
+    // fast turns). Both A and B of each encoder trigger on any change.
+    attachInterrupt(digitalPinToInterrupt(ENC1_A), enc1ISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC1_B), enc1ISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC2_A), enc2ISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC2_B), enc2ISR, CHANGE);
+
     Serial.println(F("[input] 2 encoders + 6 buttons ready "
                      "(INPUT_PULLUP, active-low)."));
 }
@@ -388,17 +466,18 @@ static void inputInit(void)
 // Poll every input, drive the UI, and log activity on serial. Runs every pass.
 static void inputPoll(void)
 {
-    int8_t d1 = encoderPoll(g_enc1);
+    int d1 = encoderTake(g_enc1);
     if (d1)
     {
         g_enc1Pos += d1;
         uiListScroll(d1); // encoder 1: forward = down, back = up
         Serial.printf("[input] ENC1 %+d -> pos %ld\n", d1, (long)g_enc1Pos);
     }
-    int8_t d2 = encoderPoll(g_enc2);
+    int d2 = encoderTake(g_enc2);
     if (d2)
     {
         g_enc2Pos += d2;
+        uiVolume(d2); // encoder 2: volume up/down
         Serial.printf("[input] ENC2 %+d -> pos %ld\n", d2, (long)g_enc2Pos);
     }
     for (int i = 0; i < NUM_BUTTONS; i++)
@@ -406,16 +485,30 @@ static void inputPoll(void)
         {
             const char *nm = g_buttons[i].name;
             Serial.printf("[input] %s pressed\n", nm);
-            // SW3 is the sole top-menu control: it cycles Playing -> Library
-            // -> Settings -> Playing. (SW2 is now unused / free for later.)
+            // Context-sensitive: SW3 cycles the top view. SW1/SW4 navigate the
+            // Library category WHEN the Library view is up, otherwise they act
+            // as track skip-forward / rewind on the now-playing track. The
+            // encoder pushes play / mute.
             if (!strcmp(nm, "SW3"))
-                uiTopMove(+1);
+                uiTopMove(+1); // cycle Playing -> Library -> Settings
             else if (!strcmp(nm, "SW1"))
-                uiCatMove(+1); // category right
+            {
+                if (g_topIndex == 1)
+                    uiCatMove(+1); // Library: category right
+                else
+                    uiNextTrack(); // else: skip forward one track
+            }
             else if (!strcmp(nm, "SW4"))
-                uiCatMove(-1); // category left
+            {
+                if (g_topIndex == 1)
+                    uiCatMove(-1); // Library: category left
+                else
+                    uiRewind(); // else: rewind (prev track / restart)
+            }
             else if (!strcmp(nm, "ENC1_SW"))
                 uiPlaySelected(); // encoder-1 push = play selected song
+            else if (!strcmp(nm, "ENC2_SW"))
+                uiToggleMute(); // encoder-2 push = mute toggle
         }
 }
 
@@ -625,8 +718,8 @@ static void parseID3(const char *path, String &title, String &artist,
         uint32_t tagSize = id3SyncSafe(hdr + 6);
         bool v22 = (major == 2);
         uint32_t frameHdrLen = v22 ? 6 : 10;
-        uint32_t pos = 10;             // first frame
-        uint32_t end = 10 + tagSize;   // end of the tag
+        uint32_t pos = 10;           // first frame
+        uint32_t end = 10 + tagSize; // end of the tag
         while (pos + frameHdrLen <= end)
         {
             f.seek(pos);
@@ -655,17 +748,25 @@ static void parseID3(const char *path, String &title, String &artist,
             String *dst = nullptr;
             if (v22)
             {
-                if (!strcmp(id, "TT2")) dst = &title;
-                else if (!strcmp(id, "TP1")) dst = &artist;
-                else if (!strcmp(id, "TAL")) dst = &album;
-                else if (!strcmp(id, "TCO")) dst = &genre;
+                if (!strcmp(id, "TT2"))
+                    dst = &title;
+                else if (!strcmp(id, "TP1"))
+                    dst = &artist;
+                else if (!strcmp(id, "TAL"))
+                    dst = &album;
+                else if (!strcmp(id, "TCO"))
+                    dst = &genre;
             }
             else
             {
-                if (!strcmp(id, "TIT2")) dst = &title;
-                else if (!strcmp(id, "TPE1")) dst = &artist;
-                else if (!strcmp(id, "TALB")) dst = &album;
-                else if (!strcmp(id, "TCON")) dst = &genre;
+                if (!strcmp(id, "TIT2"))
+                    dst = &title;
+                else if (!strcmp(id, "TPE1"))
+                    dst = &artist;
+                else if (!strcmp(id, "TALB"))
+                    dst = &album;
+                else if (!strcmp(id, "TCON"))
+                    dst = &genre;
             }
             if (dst)
             {
@@ -737,7 +838,7 @@ static void mp3PcmCallback(MP3FrameInfo &info, short *pcm, size_t len, void *ref
 static int32_t a2dpPcmCallback(Frame *frames, int32_t frameCount)
 {
     if (frameCount <= 0)
-        return 0; // defensive: never compute a bogus (huge) memset length
+        return 0;                                       // defensive: never compute a bogus (huge) memset length
     size_t wanted = (size_t)frameCount * sizeof(Frame); // Frame = L+R int16 = 4B
     size_t got = 0;
     if (g_pcmBuf)
@@ -781,6 +882,7 @@ static void mp3DecodeTask(void *param)
         g_mp3FormatLogged = false; // re-log the format for the new track
         g_playSize = f.size() ? f.size() : 1;
         g_playPos = 0;
+        g_trackStartMs = millis(); // for the rewind 5s prev-vs-restart rule
 
         // Stream the file, but bail out early if a new track was requested.
         while (f.available() && !g_trackChanged)
@@ -910,10 +1012,14 @@ static void drawNowPlaying(int16_t y)
     if (fw > 0)
         u8g2.drawBox(4, by + 2, fw, 3);
 
-    // Status line: percent + BT connection state.
-    char st[32];
-    snprintf(st, sizeof(st), "%d%%   %s", (int)(frac * 100),
-             g_btConnected ? "BT ok" : "BT ...");
+    // Status line: percent + BT connection state + volume (or MUTE).
+    char st[40];
+    if (g_muted)
+        snprintf(st, sizeof(st), "%d%%  %s  MUTE", (int)(frac * 100),
+                 g_btConnected ? "BT" : "..");
+    else
+        snprintf(st, sizeof(st), "%d%%  %s  V%d", (int)(frac * 100),
+                 g_btConnected ? "BT" : "..", g_volume * 100 / 127);
     u8g2.drawStr(2, top + 45, st);
 }
 
@@ -1030,6 +1136,7 @@ void setup()
     Serial.printf("[bt] A2DP source start -> connecting to \"%s\"...\n",
                   BT_SINK_NAME);
     a2dp_source.start(BT_SINK_NAME, a2dpPcmCallback);
+    a2dp_source.set_volume(g_volume); // seed the initial software volume
 
     Serial.println(F("[boot] setup done"));
     Serial.println(F("========================================"));
@@ -1116,6 +1223,8 @@ void loop()
             g_uiDirty = true;
             Serial.printf("[bt] %s\n", conn ? "CONNECTED -> streaming mp3"
                                             : "not connected (scanning/pairing)");
+            if (conn)
+                applyVolume(); // push our volume to the sink over AVRCP
         }
 
         // While the now-playing view is up, refresh ~1x/sec so the progress
