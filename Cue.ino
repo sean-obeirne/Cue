@@ -46,6 +46,7 @@
 #include "freertos/stream_buffer.h"
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
+#include "driver/pulse_cnt.h"
 using namespace libhelix;
 
 // On-board LED on most ESP32 DevKitV1 boards is wired to GPIO2.
@@ -110,8 +111,13 @@ static volatile uint32_t g_trackStartMs = 0; // millis() when current track bega
 
 // Volume state (A2DP 0..127). Encoder-2 rotate adjusts; its push toggles mute.
 #define VOL_STEP 1
-static int g_volume = 100; // current volume level (0..127)
+// Output floor: the user range [0..127] is remapped linearly onto
+// [VOL_FLOOR..127] before it is sent to the radio, so the QUIET end (V0) is as
+// loud as the old ~V30 while the top (V100 = 127) is completely unchanged.
+#define VOL_FLOOR 38
+static int g_volume = 26; // current volume level (0..127); boot ~= V20 on screen
 static bool g_muted = false;
+static bool g_paused = false; // Now-Playing pause/resume (encoder-1 push)
 
 // ---- Bluetooth A2DP source (streams audio OUT to a BT speaker/headphone) -----
 // Cue is the SOURCE: it connects TO this sink by its advertised name (exact,
@@ -168,30 +174,18 @@ static volatile bool g_decodeGo = false;
 #define DEBOUNCE_MS 25
 
 // TEMP: set to 1 to print every raw A/B transition on the encoders (diagnoses
-// wiring vs decode). Set back to 0 once the encoders are confirmed working.
+// TEMP: set to 1 to print every raw A/B level on the encoders (diagnoses flaky
+// WIRING vs decode). Set back to 0 once the encoders are confirmed working.
 #define ENC_DEBUG 0
 
 // TEMP: 1 prints every raw button edge (PRESS/release) so we can confirm a
 // button is electrically registering. Set back to 0 once inputs are trusted.
 #define BTN_DEBUG 0
 
-// Quadrature transition table. Index = (prev<<2)|curr, each 2 bits = (A<<1)|B.
-// Value = direction of that Gray-code transition (-1/0/+1 quarter-step).
-// DRAM_ATTR keeps it in RAM so the IRAM encoder ISR can read it even if the
-// flash cache is momentarily disabled.
-static DRAM_ATTR const int8_t QUAD_LUT[16] = {
-    0, -1, 1, 0,
-    1, 0, 0, -1,
-    -1, 0, 0, 1,
-    0, 1, -1, 0};
-
-struct Encoder
-{
-    uint8_t pinA, pinB;
-    volatile uint8_t prev;  // last (A<<1)|B reading (updated in the ISR)
-    volatile int8_t accum;  // accumulated quarter-steps; one detent = 4
-    volatile int16_t steps; // completed detents pending, drained by inputPoll
-};
+// Encoders are decoded by the ESP32 PCNT (pulse counter) peripheral in hardware
+// (see g_enc*Unit + pcntSetupEncoder below). Hardware counting is immune to
+// CPU/ISR latency under the BT load and has a glitch filter, which fixes the
+// "drops steps / needs extra turns" bounce problem the software decoders had.
 
 struct Button
 {
@@ -202,8 +196,10 @@ struct Button
     uint32_t lastEdge; // millis() of last raw change
 };
 
-static Encoder g_enc1 = {ENC1_A, ENC1_B, 0, 0, 0};
-static Encoder g_enc2 = {ENC2_A, ENC2_B, 0, 0, 0};
+static pcnt_unit_handle_t g_enc1Unit = nullptr;
+static pcnt_unit_handle_t g_enc2Unit = nullptr;
+static int g_enc1Raw = 0, g_enc2Raw = 0; // last raw PCNT count read
+static int g_enc1Rem = 0, g_enc2Rem = 0; // sub-detent count remainder
 static int32_t g_enc1Pos = 0, g_enc2Pos = 0;
 
 static Button g_buttons[] = {
@@ -319,6 +315,7 @@ static void playTrackIndex(int idx)
     strncpy(g_playPath, g_mp3Path[idx].c_str(), sizeof(g_playPath) - 1);
     g_playPath[sizeof(g_playPath) - 1] = 0;
     g_trackChanged = true;
+    g_paused = false;     // a fresh selection/skip always starts playing
     loadCurrentMeta(idx); // refresh now-playing title/artist/album
     g_topIndex = 0;       // jump to the now-playing screen
     g_uiDirty = true;
@@ -352,7 +349,15 @@ static void uiRewind(void)
 // directly. Its push toggles mute.
 static void applyVolume(void)
 {
-    a2dp_source.set_volume(g_muted ? 0 : (uint8_t)g_volume);
+    // V0 (and mute) = true silence. Otherwise remap [1..127] onto
+    // [VOL_FLOOR..127] so the quiet end stays usable while the ceiling
+    // (V100 = 127) is unchanged.
+    int out;
+    if (g_muted || g_volume <= 0)
+        out = 0;
+    else
+        out = VOL_FLOOR + (int)((long)g_volume * (127 - VOL_FLOOR) / 127);
+    a2dp_source.set_volume((uint8_t)out);
     g_uiDirty = true;
 }
 static void uiVolume(int delta)
@@ -370,50 +375,73 @@ static void uiToggleMute(void)
     Serial.printf("[vol] %s\n", g_muted ? "MUTED" : "unmuted");
 }
 
-// Interrupt-driven quadrature decode. Reading the encoders in the main loop
-// missed edges whenever the loop stalled (e.g. the ~25ms OLED I2C redraw) and
-// discarded fast multi-step turns as illegal "jumps". Instead we decode EVERY
-// A/B edge in a GPIO ISR (immune to loop timing) and queue completed detents in
-// e.steps; inputPoll() drains them. A portMUX guards the ISR<->loop handoff (the
-// two cores can touch e.steps concurrently). gpio_get_level() is IRAM-safe
-// (unlike digitalRead), so it is safe to call from the IRAM ISR.
-static portMUX_TYPE g_encMux = portMUX_INITIALIZER_UNLOCKED;
-
-static void IRAM_ATTR encoderISR(Encoder &e)
+// Encoder-1 push on Now-Playing: toggle pause / resume of the current track.
+// The decode task stops feeding while paused (file position held, buffer drains
+// -> A2DP streams silence), so resume continues seamlessly from the same spot.
+static void uiTogglePause(void)
 {
-    uint8_t curr = (gpio_get_level((gpio_num_t)e.pinA) << 1) |
-                   gpio_get_level((gpio_num_t)e.pinB);
-    portENTER_CRITICAL_ISR(&g_encMux);
-    int8_t d = QUAD_LUT[(e.prev << 2) | curr];
-    e.prev = curr;
-    if (d)
-    {
-        e.accum += d;
-        if (e.accum >= 4)
-        {
-            e.accum = 0;
-            e.steps++;
-        }
-        else if (e.accum <= -4)
-        {
-            e.accum = 0;
-            e.steps--;
-        }
-    }
-    portEXIT_CRITICAL_ISR(&g_encMux);
+    g_paused = !g_paused;
+    g_uiDirty = true;
+    Serial.printf("[mp3] %s\n", g_paused ? "PAUSED" : "resumed");
 }
-static void IRAM_ATTR enc1ISR() { encoderISR(g_enc1); }
-static void IRAM_ATTR enc2ISR() { encoderISR(g_enc2); }
 
-// Atomically take + clear the detents accumulated since the last call. Magnitude
-// may be >1 after a fast turn or a long loop stall — all of them are applied.
-static int encoderTake(Encoder &e)
+// Configure one PCNT unit as a 4x quadrature decoder for an A/B encoder. The
+// hardware counts every edge (immune to CPU/ISR latency under BT load) and a
+// glitch filter discards contact chatter, so a detent reliably nets +/-4 counts.
+static pcnt_unit_handle_t pcntSetupEncoder(int pinA, int pinB)
 {
-    portENTER_CRITICAL(&g_encMux);
-    int s = e.steps;
-    e.steps = 0;
-    portEXIT_CRITICAL(&g_encMux);
-    return s;
+    pcnt_unit_config_t uc = {};
+    uc.low_limit = -30000;
+    uc.high_limit = 30000; // read every loop, so it never wraps between polls
+    pcnt_unit_handle_t unit = nullptr;
+    if (pcnt_new_unit(&uc, &unit) != ESP_OK)
+        return nullptr;
+
+    pcnt_glitch_filter_config_t fc = {};
+    fc.max_glitch_ns = 1000; // ignore <1us spikes
+    pcnt_unit_set_glitch_filter(unit, &fc);
+
+    // Channel A: count on A edges, direction from the B level.
+    pcnt_chan_config_t ca = {};
+    ca.edge_gpio_num = pinA;
+    ca.level_gpio_num = pinB;
+    pcnt_channel_handle_t chA = nullptr;
+    pcnt_new_channel(unit, &ca, &chA);
+    pcnt_channel_set_edge_action(chA, PCNT_CHANNEL_EDGE_ACTION_DECREASE,
+                                 PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+    pcnt_channel_set_level_action(chA, PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                  PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+    // Channel B: count on B edges, direction from the A level (4x resolution).
+    pcnt_chan_config_t cb = {};
+    cb.edge_gpio_num = pinB;
+    cb.level_gpio_num = pinA;
+    pcnt_channel_handle_t chB = nullptr;
+    pcnt_new_channel(unit, &cb, &chB);
+    pcnt_channel_set_edge_action(chB, PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                 PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+    pcnt_channel_set_level_action(chB, PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                  PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+    pcnt_unit_enable(unit);
+    pcnt_unit_clear_count(unit);
+    pcnt_unit_start(unit);
+    return unit;
+}
+
+// Read completed detents since the last call (4 hardware counts = 1 detent).
+// Keeps the sub-detent remainder so nothing is lost between polls.
+static int encoderTake(pcnt_unit_handle_t unit, int &lastRaw, int &rem)
+{
+    if (!unit)
+        return 0;
+    int c = 0;
+    pcnt_unit_get_count(unit, &c);
+    rem += c - lastRaw;
+    lastRaw = c;
+    int detents = rem / 4; // truncates toward zero; remainder kept below
+    rem -= detents * 4;
+    return detents;
 }
 
 // Debounced press detector; returns true ONCE per fresh press (HIGH->LOW).
@@ -449,31 +477,47 @@ static void inputInit(void)
     for (int i = 0; i < NUM_BUTTONS; i++)
         pinMode(g_buttons[i].pin, INPUT_PULLUP);
 
-    g_enc1.prev = (digitalRead(ENC1_A) << 1) | digitalRead(ENC1_B);
-    g_enc2.prev = (digitalRead(ENC2_A) << 1) | digitalRead(ENC2_B);
+    // Decode the encoders in hardware (PCNT). The pull-ups above stay in effect;
+    // PCNT just taps the same pins through the GPIO matrix, so no edges are lost
+    // to CPU/ISR latency and a glitch filter kills contact bounce.
+    g_enc1Unit = pcntSetupEncoder(ENC1_A, ENC1_B);
+    g_enc2Unit = pcntSetupEncoder(ENC2_A, ENC2_B);
 
-    // Decode the encoders in GPIO ISRs so no edge is ever missed (loop stalls /
-    // fast turns). Both A and B of each encoder trigger on any change.
-    attachInterrupt(digitalPinToInterrupt(ENC1_A), enc1ISR, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ENC1_B), enc1ISR, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ENC2_A), enc2ISR, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ENC2_B), enc2ISR, CHANGE);
-
-    Serial.println(F("[input] 2 encoders + 6 buttons ready "
+    Serial.println(F("[input] 2 encoders (PCNT) + 6 buttons ready "
                      "(INPUT_PULLUP, active-low)."));
 }
 
 // Poll every input, drive the UI, and log activity on serial. Runs every pass.
 static void inputPoll(void)
 {
-    int d1 = encoderTake(g_enc1);
+#if ENC_DEBUG
+    // Raw A/B monitor to diagnose flaky encoder WIRING: turn slowly and watch
+    // that BOTH lines toggle. A line that never changes (or a whole spin with no
+    // output) = a broken/loose/cold-joint A or B connection, not the code.
+    {
+        static uint8_t p1 = 0xFF, p2 = 0xFF;
+        uint8_t s1 = (digitalRead(ENC1_A) << 1) | digitalRead(ENC1_B);
+        uint8_t s2 = (digitalRead(ENC2_A) << 1) | digitalRead(ENC2_B);
+        if (s1 != p1)
+        {
+            Serial.printf("[enc1-raw] A=%u B=%u\n", (s1 >> 1) & 1, s1 & 1);
+            p1 = s1;
+        }
+        if (s2 != p2)
+        {
+            Serial.printf("[enc2-raw] A=%u B=%u\n", (s2 >> 1) & 1, s2 & 1);
+            p2 = s2;
+        }
+    }
+#endif
+    int d1 = encoderTake(g_enc1Unit, g_enc1Raw, g_enc1Rem);
     if (d1)
     {
         g_enc1Pos += d1;
         uiListScroll(d1); // encoder 1: forward = down, back = up
         Serial.printf("[input] ENC1 %+d -> pos %ld\n", d1, (long)g_enc1Pos);
     }
-    int d2 = encoderTake(g_enc2);
+    int d2 = encoderTake(g_enc2Unit, g_enc2Raw, g_enc2Rem);
     if (d2)
     {
         g_enc2Pos += d2;
@@ -506,7 +550,12 @@ static void inputPoll(void)
                     uiRewind(); // else: rewind (prev track / restart)
             }
             else if (!strcmp(nm, "ENC1_SW"))
-                uiPlaySelected(); // encoder-1 push = play selected song
+            {
+                if (g_topIndex == 0)
+                    uiTogglePause(); // Now-Playing: pause / resume
+                else
+                    uiPlaySelected(); // else: play the selected song
+            }
             else if (!strcmp(nm, "ENC2_SW"))
                 uiToggleMute(); // encoder-2 push = mute toggle
         }
@@ -887,6 +936,13 @@ static void mp3DecodeTask(void *param)
         // Stream the file, but bail out early if a new track was requested.
         while (f.available() && !g_trackChanged)
         {
+            // Pause: stop feeding the pipeline (file position held, buffer
+            // drains -> A2DP outputs silence). A track change still breaks out.
+            if (g_paused)
+            {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
             int n = f.read(inbuf, CHUNK);
             if (n > 0)
             {
@@ -1012,9 +1068,11 @@ static void drawNowPlaying(int16_t y)
     if (fw > 0)
         u8g2.drawBox(4, by + 2, fw, 3);
 
-    // Status line: percent + BT connection state + volume (or MUTE).
+    // Status line: percent + BT connection state + volume (or MUTE / PAUSED).
     char st[40];
-    if (g_muted)
+    if (g_paused)
+        snprintf(st, sizeof(st), "PAUSED  %s", g_btConnected ? "BT" : "..");
+    else if (g_muted)
         snprintf(st, sizeof(st), "%d%%  %s  MUTE", (int)(frac * 100),
                  g_btConnected ? "BT" : "..");
     else
